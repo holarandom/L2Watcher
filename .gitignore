@@ -1,0 +1,31 @@
+# ── Секреты и пользовательские данные ───────────────────────
+# config.json содержит токен бота и chat_id — НИКОГДА не коммитить!
+config.json
+feedback_config.json
+*.log
+templates/
+template_*.png
+app_icon.ico
+
+# ── Сборка ──────────────────────────────────────────────────
+build/
+dist/
+*.spec
+build_log.txt
+L2Watcher_v*.zip
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── IDE / ОС ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

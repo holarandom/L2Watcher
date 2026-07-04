@@ -1,0 +1,8 @@
+aiogram
+opencv-python
+numpy
+Pillow
+pywin32
+pystray
+sv-ttk
+pyinstaller
