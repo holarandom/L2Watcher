@@ -1,6 +1,6 @@
 # main.py
 """
-Главный файл приложения L2 Monitor.
+Главный файл приложения L2 Watcher.
 
 Запуск:
 1. Загружает конфиг (или открывает GUI настроек если конфиг не заполнен)
@@ -272,6 +272,15 @@ class L2MonitorApp:
 
         from version import APP_VERSION, APP_NAME
         lines = [f"🩺 Проверка состояния\n{APP_NAME} v{APP_VERSION}\n"]
+
+        # Известно о новой версии? (метка ставится циклом проверки обновлений)
+        _upd = self.cfg.get("update_notified_version", "")
+        try:
+            from update_checker import _newer, RELEASES_PAGE
+            if _upd and _newer(_upd, APP_VERSION):
+                lines.append(f"🆕 Доступна версия {_upd}: {RELEASES_PAGE}")
+        except Exception:
+            pass
 
         # Мониторинг
         running = self._is_monitoring_running()
@@ -639,6 +648,10 @@ class L2MonitorApp:
             await self._handle_start()
             await self.tg.send("🟢 Мониторинг запущен автоматически")
 
+        # Фоновая проверка обновлений (GitHub Releases, раз в сутки)
+        from update_checker import update_check_loop
+        asyncio.create_task(update_check_loop(self))
+
         await self.tg.start_polling()
 
     def _show_token_error(self):
@@ -832,9 +845,10 @@ def main():
         try:
             import tkinter.messagebox as mb
             import tkinter as tk
+            from version import APP_NAME
             r = tk.Tk(); r.withdraw()
-            mb.showinfo("L2 Monitor уже запущен",
-                        "L2 Monitor уже работает.\n"
+            mb.showinfo(f"{APP_NAME} уже запущен",
+                        f"{APP_NAME} уже работает.\n"
                         "Иконка приложения есть в системном трее (рядом с часами).")
             r.destroy()
         except Exception:

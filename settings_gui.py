@@ -100,7 +100,7 @@ class SettingsWindow:
             from version import APP_NAME, APP_VERSION
             self.root.title(f"{APP_NAME} v{APP_VERSION} — Настройки")
         except Exception:
-            self.root.title("L2 Monitor — Настройки")
+            self.root.title("L2 Watcher — Настройки")
         self.root.geometry("600x640")
         self.root.minsize(560, 480)
         self.root.resizable(True, True)
@@ -368,7 +368,7 @@ class SettingsWindow:
         self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
         ttk.Checkbutton(
             auto_frame,
-            text="Запускать L2 Monitor автоматически при включении компьютера",
+            text="Запускать L2 Watcher автоматически при включении компьютера",
             variable=self.autostart_var
         ).pack(padx=8, pady=8, anchor="w")
 

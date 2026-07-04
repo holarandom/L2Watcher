@@ -31,9 +31,16 @@ if "%NEWVER%"=="" (
     exit /b 1
 )
 
-REM -- write new version into version.py --
-python -c "import re,io; p='version.py'; s=open(p,encoding='utf-8').read(); s=re.sub(r'APP_VERSION = \"[^\"]+\"','APP_VERSION = \"%NEWVER%\"',s); open(p,'w',encoding='utf-8').write(s); print('version.py -> %NEWVER%')"
-if errorlevel 1 (
+REM -- write new version into version.py (via temp script, quotes-safe) --
+echo import re > _setver.py
+echo s = open('version.py', encoding='utf-8').read() >> _setver.py
+echo s = re.sub(r'APP_VERSION = "[^"]+"', 'APP_VERSION = "%NEWVER%"', s) >> _setver.py
+echo open('version.py', 'w', encoding='utf-8').write(s) >> _setver.py
+echo print('version.py -^> %NEWVER%') >> _setver.py
+python _setver.py
+set SETVER_RC=%errorlevel%
+del _setver.py
+if not "%SETVER_RC%"=="0" (
     echo FAILED to update version.py
     pause
     exit /b 1
@@ -42,14 +49,11 @@ if errorlevel 1 (
 echo.
 echo [release] Running normal build...
 call build.bat
-if errorlevel 1 (
-    echo Build failed, see build_log.txt
-    pause
-    exit /b 1
-)
 
-if not exist "dist\L2Watcher" (
-    echo dist\L2Watcher not found - build failed?
+REM build.bat may end with pause/nonzero code even on success -
+REM so we check the actual result file instead of errorlevel.
+if not exist "dist\L2Watcher\L2Watcher.exe" (
+    echo Build failed - L2Watcher.exe not found. See build_log.txt
     pause
     exit /b 1
 )

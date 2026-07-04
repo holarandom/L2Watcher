@@ -38,6 +38,7 @@ class TrayIcon:
 
     def _build_icon(self):
         import pystray
+        from version import APP_NAME, APP_VERSION, APP_ID
         from PIL import Image
 
         icon_path = _resource_path(ICON_FILENAME)
@@ -62,7 +63,7 @@ class TrayIcon:
         )
 
         self._icon = pystray.Icon(
-            "L2Monitor", image, "L2 Monitor", menu,
+            APP_ID, image, f"{APP_NAME} v{APP_VERSION}", menu,
         )
 
     def _handle_settings(self, icon, item):
