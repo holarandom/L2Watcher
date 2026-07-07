@@ -25,6 +25,7 @@ class GameWindow:
 
         self.death_notified = False
         self.disconnect_notified = False
+        self._clear_ticks = 0  # подряд 'чистых' тиков (ни смерти, ни дисконнекта)
 
         # Реальное состояние на последнем тике — для /status. В отличие от
         # *_notified флагов (которые завязаны на combined-логику "одно
@@ -118,6 +119,7 @@ class GameWindow:
             disconnect_active = score >= thresholds["disconnect"]
             if disconnect_active:
                 self.last_state = "disconnect"
+                self._clear_ticks = 0
                 if not already_notified:
                     self.disconnect_notified = True
                     await notify_fn("disconnect", self.char_name, self.version, self.hwnd)
@@ -136,6 +138,7 @@ class GameWindow:
             score = self.find_template(frame, tmpl_death, thresholds["death"], tmpl_key)
             if score >= thresholds["death"]:
                 self.last_state = "dead"
+                self._clear_ticks = 0
                 if not already_notified:
                     self.death_notified = True
                     await notify_fn("death", self.char_name, self.version, self.hwnd)
@@ -144,9 +147,15 @@ class GameWindow:
         # Сюда дошли — значит ни дисконнекта, ни смерти на экране нет.
         # Персонаж в игре: сбрасываем ОБА флага, открывая путь следующим
         # уведомлениям, если ситуация повторится позже.
+        # ГИСТЕРЕЗИС: сбрасываем флаги 'уже уведомил' только после 3 подряд
+        # чистых тиков (~30 сек). Слабый шаблон может мерцать вокруг порога
+        # (0.84 -> 0.86 -> 0.84...) — без гистерезиса каждое мигание сбрасывало
+        # флаг и следующее совпадение слало НОВОЕ уведомление (спам).
         self.last_state = "alive"
-        self.death_notified = False
-        self.disconnect_notified = False
+        self._clear_ticks += 1
+        if self._clear_ticks >= 3:
+            self.death_notified = False
+            self.disconnect_notified = False
 
 
 class WindowRegistry:
