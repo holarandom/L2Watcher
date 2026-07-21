@@ -29,3 +29,6 @@ env/
 *.swp
 Thumbs.db
 desktop.ini
+exp/
+L2Watcher_v*/
+exp_module.zip
