@@ -4,16 +4,98 @@
 - автоматически при первом запуске (если конфиг не заполнен)
 - по запросу из трея ("Настройки") в любой момент
 """
+import os
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 from config_manager import load_config, save_config
 import autostart
 
 
+def _resource_path(filename: str) -> str:
+    """Путь к ресурсу рядом с exe/скриптом. В собранном PyInstaller-exe
+    файлы распакованы во временную папку sys._MEIPASS."""
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, filename)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+
+class SidebarNav(ttk.Frame):
+    """
+    Боковая навигация настроек (макет 1b): вертикальный список разделов
+    вместо вкладок Notebook. В ttk нет готового пункта навигации, поэтому
+    каждый пункт собран из tk.Frame + tk.Label — только так можно покрасить
+    фон активного пункта и левую акцентную полосу.
+    """
+
+    def __init__(self, parent, colors, on_select, width=220):
+        super().__init__(parent, width=width)
+        self.pack_propagate(False)
+        self._colors = colors
+        self._on_select = on_select
+        self._items = {}       # key -> (row_frame, accent_bar, label)
+        self._active = None
+
+        self._holder = tk.Frame(self, bg=colors["side_bg"], highlightthickness=0, bd=0)
+        self._holder.pack(fill="both", expand=True)
+
+    def add(self, key: str, title: str):
+        c = self._colors
+        row = tk.Frame(self._holder, bg=c["side_bg"], highlightthickness=0, bd=0)
+        row.pack(fill="x", padx=6, pady=1)
+
+        # Акцентная полоса слева (2 px) — видна только у активного пункта.
+        bar = tk.Frame(row, bg=c["side_bg"], width=2)
+        bar.pack(side="left", fill="y")
+
+        lbl = tk.Label(
+            row, text=title, bg=c["side_bg"], fg=c["side_fg"],
+            anchor="w", padx=12, pady=8, font=("", 10)
+        )
+        lbl.pack(side="left", fill="x", expand=True)
+
+        for w in (row, lbl, bar):
+            w.bind("<Button-1>", lambda _e, k=key: self.select(k))
+            w.bind("<Enter>", lambda _e, k=key: self._hover(k, True))
+            w.bind("<Leave>", lambda _e, k=key: self._hover(k, False))
+            try:
+                w.config(cursor="hand2")
+            except Exception:
+                pass
+
+        self._items[key] = (row, bar, lbl)
+        if self._active is None:
+            self.select(key)
+
+    def _hover(self, key, entering):
+        if key == self._active:
+            return
+        c = self._colors
+        row, bar, lbl = self._items[key]
+        bg = c["side_hover"] if entering else c["side_bg"]
+        row.config(bg=bg)
+        lbl.config(bg=bg)
+        bar.config(bg=bg)
+
+    def select(self, key: str):
+        c = self._colors
+        for k, (row, bar, lbl) in self._items.items():
+            if k == key:
+                row.config(bg=c["side_active_bg"])
+                lbl.config(bg=c["side_active_bg"], fg=c["side_active_fg"])
+                bar.config(bg=c["accent"])
+            else:
+                row.config(bg=c["side_bg"])
+                lbl.config(bg=c["side_bg"], fg=c["side_fg"])
+                bar.config(bg=c["side_bg"])
+        self._active = key
+        self._on_select(key)
+
+
 class ScrollableFrame(ttk.Frame):
     """
     Прокручиваемый контейнер: Canvas + внутренний Frame + скроллбар.
-    Нужен, чтобы содержимое вкладки могло быть любой высоты — лишнее
+    Нужен, чтобы содержимое раздела могло быть любой высоты — лишнее
     уезжает под скролл, а не за край окна. Это убирает необходимость
     подбирать высоту окна под каждую новую секцию настроек.
     """
@@ -23,27 +105,48 @@ class ScrollableFrame(ttk.Frame):
         self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
         if bg:
             self.canvas.config(background=bg)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self._scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
         self.inner = ttk.Frame(self.canvas)
+        self._bar_shown = False
 
-        self.inner.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
+        self.inner.bind("<Configure>", self._on_inner_configure)
         self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         # Внутренний фрейм растягиваем по ширине канваса
-        self.canvas.bind(
-            "<Configure>",
-            lambda e: self.canvas.itemconfig(self._window, width=e.width)
-        )
-        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.configure(yscrollcommand=self._scrollbar.set)
 
         self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        # Скроллбар НЕ пакуется сразу: он появляется только когда контент
+        # реально не помещается (см. _sync_scrollbar). Раньше полоса висела
+        # всегда, даже на полупустых разделах — выглядело неряшливо.
 
         # Прокрутка колесом мыши, пока курсор над этим контейнером
         self.canvas.bind("<Enter>", self._bind_wheel)
         self.canvas.bind("<Leave>", self._unbind_wheel)
+
+    def _on_inner_configure(self, _e=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._sync_scrollbar()
+
+    def _on_canvas_configure(self, e):
+        self.canvas.itemconfig(self._window, width=e.width)
+        self._sync_scrollbar()
+
+    def _sync_scrollbar(self):
+        """Показывает полосу прокрутки только если контент выше окна.
+        Состояние меняется ТОЛЬКО при реальной смене — иначе pack/forget
+        меняет ширину канваса, тот шлёт <Configure>, и получается
+        бесконечный цикл мигания полосы."""
+        try:
+            need = self.inner.winfo_reqheight() > self.canvas.winfo_height() + 1
+        except Exception:
+            return
+        if need and not self._bar_shown:
+            self._scrollbar.pack(side="right", fill="y")
+            self._bar_shown = True
+        elif not need and self._bar_shown:
+            self._scrollbar.pack_forget()
+            self._bar_shown = False
 
     def _bind_wheel(self, _):
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
@@ -52,6 +155,10 @@ class ScrollableFrame(ttk.Frame):
         self.canvas.unbind_all("<MouseWheel>")
 
     def _on_wheel(self, event):
+        # Если контент помещается целиком — колесо не крутит ничего,
+        # иначе канвас "уезжает" и содержимое пропадает вверх.
+        if not self._bar_shown:
+            return
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
@@ -101,9 +208,24 @@ class SettingsWindow:
             self.root.title(f"{APP_NAME} v{APP_VERSION} — Настройки")
         except Exception:
             self.root.title("L2 Watcher — Настройки")
-        self.root.geometry("600x640")
-        self.root.minsize(560, 480)
+        # Ширина увеличена относительно версии с вкладками: боковая
+        # навигация забирает 200 px, и при старых 600 px поле токена с
+        # кнопкой-глазом и кнопка инструкции не помещались в колонку.
+        self.root.geometry("820x660")
+        self.root.minsize(720, 520)
         self.root.resizable(True, True)
+
+        # Иконка окна настроек (та же монограмма, что в трее и на exe).
+        # Сначала .ico — Windows показывает его чётче в панели задач;
+        # если .ico нет (запуск из исходников без сборки) — PNG.
+        try:
+            self.root.iconbitmap(_resource_path("app_icon.ico"))
+        except Exception:
+            try:
+                self._icon_img = tk.PhotoImage(file=_resource_path("tray_icon.png"))
+                self.root.iconphoto(True, self._icon_img)
+            except Exception:
+                pass
 
         # Тема оформления под систему (тёмная/светлая) — до построения UI,
         # чтобы виджеты сразу создавались в нужной теме.
@@ -197,6 +319,37 @@ class SettingsWindow:
             return {"bg": "#fbfbfb", "fg": "#202020", "sel": "#cfe8ff"}
         return {"bg": "#1c1c1c", "fg": "#e0e0e0", "sel": "#2f5d8a"}
 
+    def _nav_colors(self) -> dict:
+        """Палитра боковой навигации (макет 1b). Акцент #4cc2ff общий для
+        обеих тем, фоны подбираются под тёмную/светлую."""
+        accent = "#4cc2ff"
+        if self.theme == "light" and getattr(self, "_sv_ttk_ok", False):
+            return {
+                "accent": accent,
+                "side_bg": "#f3f3f3",
+                "side_hover": "#e8e8e8",
+                "side_active_bg": "#dcf0fb",
+                "side_fg": "#404040",
+                "side_active_fg": "#0b1420",
+            }
+        if not getattr(self, "_sv_ttk_ok", False):
+            return {
+                "accent": accent,
+                "side_bg": "#f0f0f0",
+                "side_hover": "#e4e4e4",
+                "side_active_bg": "#dcf0fb",
+                "side_fg": "#303030",
+                "side_active_fg": "#0b1420",
+            }
+        return {
+            "accent": accent,
+            "side_bg": "#1f1e22",
+            "side_hover": "#2a2a2f",
+            "side_active_bg": "#1e3a4a",
+            "side_fg": "#a8a8ad",
+            "side_active_fg": "#f2f2f2",
+        }
+
     def _style_tk_widget(self, widget):
         """Применяет цвета темы к tk-виджету (Listbox/Text)."""
         c = self._theme_colors()
@@ -222,6 +375,8 @@ class SettingsWindow:
         # независимо от того, сколько места займут блоки выше (раньше
         # из-за порядка паковки кнопка могла визуально "уезжать" за
         # пределы окна, хотя физически существовала в коде).
+        # Нижняя панель ОБЩАЯ для всех разделов — она в self.root, а не
+        # внутри страницы, поэтому при переключении разделов не мигает.
         btn_frame = ttk.Frame(self.root)
         btn_frame.pack(side="bottom", fill="x", padx=10, pady=10)
 
@@ -229,38 +384,76 @@ class SettingsWindow:
                                    command=self._save, state="disabled")
         self.save_btn.pack(side="right", padx=4)
 
-        # Вкладки вверху. Notebook пакуется после
-        # кнопок (которые side="bottom"), поэтому занимает всё оставшееся
-        # место сверху, а кнопки Сохранить/Отмена всегда видны внизу.
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(side="top", fill="both", expand=True, padx=6, pady=6)
+        # Кнопка Сохранить — акцентная. Цвет даёт сам sv_ttk через свой
+        # стиль Accent.TButton (#57c8ff, практически совпадает с #4cc2ff
+        # из макета). Своя style.configure здесь НЕ ставится: тема sv_ttk
+        # перекрывает её собственным layout'ом, строка была бы мёртвой.
+        try:
+            self.save_btn.config(style="Accent.TButton")
+        except Exception:
+            pass
 
-        tab_main_outer = ttk.Frame(notebook)
-        tab_work = ttk.Frame(notebook)
-        tab_style = ttk.Frame(notebook)
-        notebook.add(tab_main_outer, text="Основные")
-        notebook.add(tab_work, text="Контроль работы")
-        notebook.add(tab_style, text="Оформление")
-        tab_feedback = ttk.Frame(notebook)
-        notebook.add(tab_feedback, text="Обратная связь")
+        # ── Две колонки: слева навигация, справа страница раздела ──
+        # Пакуется ПОСЛЕ кнопок (у тех side="bottom"), поэтому занимает
+        # всё оставшееся место, а кнопки всегда видны внизу.
+        body = ttk.Frame(self.root)
+        body.pack(side="top", fill="both", expand=True)
 
-        # Вкладка "Основные" — прокручиваемая, секции сворачиваются.
-        # Так контент любой высоты помещается без подбора размера окна.
-        scroll = ScrollableFrame(tab_main_outer, theme_colors=self._theme_colors())
-        scroll.pack(fill="both", expand=True)
-        tab_main = scroll.inner
+        nav_colors = self._nav_colors()
+        self.sidebar = SidebarNav(body, nav_colors, self._show_page, width=200)
+        self.sidebar.pack(side="left", fill="y")
 
-        # Стиль для заголовков секций (плоская кнопка, выравнивание влево)
+        self.content = ttk.Frame(body)
+        self.content.pack(side="left", fill="both", expand=True)
+
+        # Каждая страница прокручиваемая: содержимое любой высоты уезжает
+        # под скролл, а не за край окна.
+        self.pages = {}
+        page_defs = [
+            ("telegram",   "Telegram",        self._build_page_telegram),
+            ("characters", "Персонажи",       self._build_page_characters),
+            ("templates",  "Шаблоны",         self._build_page_templates),
+            ("autostart",  "Автозапуск",      self._build_page_autostart),
+            ("quiet",      "Тихий режим",     self._build_page_quiet),
+            ("capture",    "Захват окон",     self._build_page_capture),
+            ("style",      "Оформление",      self._build_style_tab),
+            ("feedback",   "Обратная связь",  self._build_feedback_tab),
+        ]
+
+        # Стиль для заголовков секций (используется старым кодом секций)
         try:
             style = ttk.Style()
             style.configure("Section.TButton", anchor="w", font=("", 10, "bold"))
         except Exception:
             pass
 
-        # ── Telegram ──
-        sec_tg = CollapsibleSection(tab_main, "Telegram (бот и чат)", expanded=False)
-        sec_tg.pack(fill="x", padx=8, pady=4)
-        tg_frame = sec_tg.body
+        for key, title, builder in page_defs:
+            scroll = ScrollableFrame(self.content, theme_colors=self._theme_colors())
+            page = scroll.inner
+            builder(page)
+            self.pages[key] = scroll
+
+        # Пункты навигации добавляем ПОСЛЕ создания всех страниц: add()
+        # у первого пункта сразу вызывает select() -> _show_page(), а тот
+        # обращается к self.pages. Если добавить раньше — KeyError.
+        for key, title, _builder in page_defs:
+            self.sidebar.add(key, title)
+
+    def _show_page(self, key: str):
+        """Показывает один раздел, прячет остальные."""
+        for k, frame in self.pages.items():
+            frame.pack_forget()
+        self.pages[key].pack(fill="both", expand=True, padx=16, pady=12)
+
+    # ── Страницы разделов ────────────────────────────────────────────────
+    def _page_title(self, parent, text):
+        ttk.Label(parent, text=text, font=("", 13, "bold")).pack(
+            anchor="w", padx=8, pady=(4, 10))
+
+    def _build_page_telegram(self, parent):
+        self._page_title(parent, "Telegram (бот и чат)")
+        tg_frame = ttk.Frame(parent)
+        tg_frame.pack(fill="x", padx=8)
 
         ttk.Label(tg_frame, text="Токен бота:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
         self.token_entry = ttk.Entry(tg_frame, width=42, show="●")
@@ -282,10 +475,10 @@ class SettingsWindow:
             command=self._show_instructions
         ).grid(row=2, column=0, columnspan=3, pady=6)
 
-        # ── Персонажи ──
-        sec_chars = CollapsibleSection(tab_main, "Персонажи (окна игры)", expanded=False)
-        sec_chars.pack(fill="x", padx=8, pady=4)
-        chars_frame = sec_chars.body
+    def _build_page_characters(self, parent):
+        self._page_title(parent, "Персонажи (окна игры)")
+        chars_frame = ttk.Frame(parent)
+        chars_frame.pack(fill="both", expand=True, padx=8)
 
         ttk.Label(
             chars_frame,
@@ -293,8 +486,8 @@ class SettingsWindow:
                  "как удобно: \"танк\", \"хилер\", \"иса\", \"волк\" и т.д.\n"
                  "При запуске нового окна бот пришлёт его скриншот и\n"
                  "попросит выбрать персонажа из этого списка.",
-            justify="left", foreground="#555"
-        ).pack(padx=8, pady=(8, 4), anchor="w")
+            justify="left", foreground="#888"
+        ).pack(padx=8, pady=(0, 8), anchor="w")
 
         list_frame = ttk.Frame(chars_frame)
         list_frame.pack(fill="both", expand=True, padx=8, pady=8)
@@ -341,10 +534,10 @@ class SettingsWindow:
 
         self._editing_index = None  # индекс редактируемой записи (None — режим добавления)
 
-        # ── Шаблоны (самообучение) ──
-        sec_tmpl = CollapsibleSection(tab_main, "Шаблоны распознавания", expanded=False)
-        sec_tmpl.pack(fill="x", padx=8, pady=4)
-        tmpl_frame = sec_tmpl.body
+    def _build_page_templates(self, parent):
+        self._page_title(parent, "Шаблоны распознавания")
+        tmpl_frame = ttk.Frame(parent)
+        tmpl_frame.pack(fill="x", padx=8)
 
         self.tmpl_status_label = ttk.Label(tmpl_frame, text="")
         self.tmpl_status_label.pack(padx=8, pady=4, anchor="w")
@@ -360,10 +553,10 @@ class SettingsWindow:
             command=self._open_templates_folder
         ).pack(side="left")
 
-        # ── Автозагрузка ──
-        sec_auto = CollapsibleSection(tab_main, "Запуск с Windows", expanded=False)
-        sec_auto.pack(fill="x", padx=8, pady=4)
-        auto_frame = sec_auto.body
+    def _build_page_autostart(self, parent):
+        self._page_title(parent, "Запуск с Windows")
+        auto_frame = ttk.Frame(parent)
+        auto_frame.pack(fill="x", padx=8)
 
         self.autostart_var = tk.BooleanVar(value=autostart.is_enabled())
         ttk.Checkbutton(
@@ -381,12 +574,9 @@ class SettingsWindow:
             variable=self.autostart_monitoring_var
         ).pack(padx=8, pady=(0, 8), anchor="w")
 
-        self._build_work_tab(tab_work)
-        self._build_style_tab(tab_style)
-        self._build_feedback_tab(tab_feedback)
 
     def _build_feedback_tab(self, parent):
-        """Вкладка обратной связи: ссылка на фидбек-бота + помощь с логом."""
+        """Раздел обратной связи: ссылка на фидбек-бота + помощь с логом."""
         pad = {"padx": 10, "pady": 6}
 
         frame = ttk.LabelFrame(parent, text="Нашёл баг или есть идея?")
@@ -429,14 +619,13 @@ class SettingsWindow:
             foreground="#888", justify="left"
         ).pack(padx=8, pady=(0, 8), anchor="w")
 
-    def _build_style_tab(self, outer):
-        """Вкладка выбора стиля оформления сообщений бота с превью."""
+    def _build_style_tab(self, parent):
+        """Раздел выбора стиля оформления сообщений бота с превью."""
         import message_styles
-        # Прокрутка: контента много (стили + превью + формат выбора),
-        # на небольших экранах низ не влезает — оборачиваем в скролл.
-        scroll = ScrollableFrame(outer, theme_colors=self._theme_colors())
-        scroll.pack(fill="both", expand=True)
-        parent = scroll.inner
+        # ВАЖНО: свой ScrollableFrame здесь больше НЕ создаётся. Каждый
+        # раздел настроек уже обёрнут в прокручиваемую страницу в
+        # _build_ui — вложенный скролл давал два скроллбара подряд и
+        # сплющивал содержимое в узкую полосу.
         pad = {"padx": 10, "pady": 6}
 
         sel_frame = ttk.LabelFrame(parent, text="Стиль сообщений в Telegram")
@@ -536,21 +725,20 @@ class SettingsWindow:
     def _on_style_preview(self, event=None):
         self._render_style_preview(self._label_to_style(self.style_combo.get()))
 
-    def _build_work_tab(self, parent):
-        """Вкладка Контроль работы — тихий режим по расписанию."""
-        pad = {"padx": 10, "pady": 6}
+    def _build_page_quiet(self, parent):
+        """Раздел Тихий режим — пауза по расписанию."""
+        self._page_title(parent, "Тихий режим (пауза по расписанию)")
+        quiet_frame = ttk.Frame(parent)
+        quiet_frame.pack(fill="x", padx=8)
 
-        # ── Тихий режим ──
         qh_cfg = self.cfg.get("quiet_hours", {})
-        quiet_frame = ttk.LabelFrame(parent, text="Тихий режим (пауза по расписанию)")
-        quiet_frame.pack(fill="x", **pad)
 
         ttk.Label(
             quiet_frame,
             text="В заданные часы приложение не сканирует окна — не нагружает\n"
                  "процессор и не шумит кулерами. Например, ночью. Время системное.",
             foreground="#888", justify="left"
-        ).pack(padx=8, pady=(8, 4), anchor="w")
+        ).pack(padx=8, pady=(0, 8), anchor="w")
 
         self.quiet_enabled_var = tk.BooleanVar(value=qh_cfg.get("enabled", False))
         ttk.Checkbutton(
@@ -571,9 +759,12 @@ class SettingsWindow:
         ttk.Label(time_row, text="(формат ЧЧ:ММ, можно через полночь)",
                   foreground="#888").pack(side="left")
 
-        # ── Чтение перекрытых окон ──
-        overlap_frame = ttk.LabelFrame(parent, text="Захват окон")
-        overlap_frame.pack(fill="x", **pad)
+    def _build_page_capture(self, parent):
+        """Раздел Захват окон — чтение перекрытых окон."""
+        self._page_title(parent, "Захват окон")
+        overlap_frame = ttk.Frame(parent)
+        overlap_frame.pack(fill="x", padx=8)
+
         self.overlap_var = tk.BooleanVar(
             value=self.cfg.get("read_overlapped_windows", False)
         )
@@ -581,7 +772,7 @@ class SettingsWindow:
             overlap_frame,
             text="Читать перекрытые окна (для мультибокса с наложением)",
             variable=self.overlap_var
-        ).pack(padx=8, pady=(8, 0), anchor="w")
+        ).pack(padx=8, pady=(0, 0), anchor="w")
         ttk.Label(
             overlap_frame,
             text="    Позволяет мониторить окна, закрытые сверху другими окнами.\n"

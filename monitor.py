@@ -14,6 +14,21 @@ import win32gui
 
 logger = logging.getLogger(__name__)
 
+# Зазор ниже порога, в котором совпадение считается "БЛИЗКИЙ ПРОМАХ"
+# и логируется на INFO (диагностика пропущенных событий).
+NEAR_MISS_MARGIN = 0.12
+
+# Зазор ниже порога, в котором тик НЕ считается "события точно нет".
+# Шире, чем NEAR_MISS_MARGIN, специально: шаблон мёртвого персонажа
+# в логах проваливался до 0.631 при пороге 0.75, оставаясь при этом
+# на экране. Всё, что выше (порог - RESET_MARGIN), считаем "событие
+# возможно всё ещё на экране" и замок не открываем.
+RESET_MARGIN = 0.20
+
+# Сколько подряд ЯВНО чистых тиков нужно, чтобы открыть замок
+# (~30 сек при тике в 12 сек).
+CLEAR_TICKS_REQUIRED = 3
+
 
 class GameWindow:
     """Состояние одного отслеживаемого окна игры."""
@@ -25,7 +40,11 @@ class GameWindow:
 
         self.death_notified = False
         self.disconnect_notified = False
-        self._clear_ticks = 0  # подряд 'чистых' тиков (ни смерти, ни дисконнекта)
+        # Счётчики чистых тиков ОТДЕЛЬНО для каждого события. Раньше был
+        # один общий, из-за чего замки смерти и дисконнекта открывались
+        # вместе, хотя события независимы.
+        self._clear_ticks_death = 0
+        self._clear_ticks_disconnect = 0
 
         # Реальное состояние на последнем тике — для /status. В отличие от
         # *_notified флагов (которые завязаны на combined-логику "одно
@@ -63,7 +82,7 @@ class GameWindow:
             # события: например, дисконнект был на экране, но шаблон чуть не
             # дотянул до порога, и уведомление не ушло. Без этого такие случаи
             # неотличимы от "ничего не было".
-            if threshold - 0.12 <= max_val < threshold:
+            if threshold - NEAR_MISS_MARGIN <= max_val < threshold:
                 logger.info(
                     f"[{self.label}] {name}: БЛИЗКИЙ ПРОМАХ совпадение "
                     f"{max_val:.3f} (порог {threshold}) — событие почти "
@@ -86,13 +105,13 @@ class GameWindow:
         Главная проверка состояния окна за один тик.
         notify_fn(event_text, label) — асинхронная функция отправки уведомления.
 
-        Смерть и дисконнект считаются одной "проблемной ситуацией" —
-        если уже отправили уведомление об одном из них, второе не шлём
-        (например: умер → потом дисконнект пока лежит мёртвый — это не
-        новая информация, человек и так уже знает что нужно подойти).
-        Уведомление сбрасывается молча, без отдельного сообщения о том,
-        что всё разрешилось — это только что бы открыть путь следующему
-        уведомлению, если ситуация повторится позже.
+        Смерть и дисконнект — НЕЗАВИСИМЫЕ события, у каждого свой "замок":
+          • событие появилось на экране → один пинг, замок закрывается;
+          • событие продолжает висеть на экране → молчим;
+          • событие точно исчезло с экрана → замок открывается молча;
+          • событие появилось снова позже → снова один пинг.
+        Раньше замок был общий (already_notified): смерть глушила
+        последующий дисконнект, хотя это ДРУГОЙ статус и о нём нужно знать.
         """
         # Закрытие окна обрабатывается НЕ здесь, а в главном цикле через
         # registry.get_closed() — он шлёт одно уведомление и убирает окно
@@ -105,57 +124,79 @@ class GameWindow:
         if frame is None:
             return
 
-        already_notified = self.death_notified or self.disconnect_notified
-
         # ── Дисконнект ──
         # Шаблон выбирается по версии окна (main/essence) — таблички разрыва
         # соединения в этих версиях визуально разные, поэтому общий шаблон
         # матчился ненадёжно (на Essence мог не сработать).
         dc_key = f"{self.version}_disconnect"
         tmpl_dc = templates.get(dc_key)
+        dc_threshold = thresholds["disconnect"]
         disconnect_active = False
+        disconnect_clean = True  # тик, на котором таблички ТОЧНО нет
         if tmpl_dc is not None:
-            score = self.find_template(frame, tmpl_dc, thresholds["disconnect"], dc_key)
-            disconnect_active = score >= thresholds["disconnect"]
-            if disconnect_active:
-                self.last_state = "disconnect"
-                self._clear_ticks = 0
-                if not already_notified:
-                    self.disconnect_notified = True
-                    await notify_fn("disconnect", self.char_name, self.version, self.hwnd)
-                return
-            # ВАЖНО: НЕ сбрасываем disconnect_notified здесь. Раньше тут был
-            # сброс флага на каждый тик, когда табличка не распозналась — но
-            # табличка дисконнекта может на миг "мигнуть"/не совпасть, и тогда
-            # флаг сбрасывался, а на следующем тике слалось НОВОЕ уведомление.
-            # Отсюда был спам раз в минуту. Флаг сбрасываем только ниже —
-            # когда персонаж реально снова ЖИВ (не дисконнект и не смерть).
+            score = self.find_template(frame, tmpl_dc, dc_threshold, dc_key)
+            disconnect_active = score >= dc_threshold
+            disconnect_clean = score < dc_threshold - RESET_MARGIN
 
         # ── Смерть ──
-        tmpl_key = f"{self.version}_death"
-        tmpl_death = templates.get(tmpl_key)
+        death_key = f"{self.version}_death"
+        tmpl_death = templates.get(death_key)
+        death_threshold = thresholds["death"]
+        death_active = False
+        death_clean = True
         if tmpl_death is not None:
-            score = self.find_template(frame, tmpl_death, thresholds["death"], tmpl_key)
-            if score >= thresholds["death"]:
-                self.last_state = "dead"
-                self._clear_ticks = 0
-                if not already_notified:
-                    self.death_notified = True
-                    await notify_fn("death", self.char_name, self.version, self.hwnd)
-                return
+            score = self.find_template(frame, tmpl_death, death_threshold, death_key)
+            death_active = score >= death_threshold
+            death_clean = score < death_threshold - RESET_MARGIN
 
-        # Сюда дошли — значит ни дисконнекта, ни смерти на экране нет.
-        # Персонаж в игре: сбрасываем ОБА флага, открывая путь следующим
-        # уведомлениям, если ситуация повторится позже.
-        # ГИСТЕРЕЗИС: сбрасываем флаги 'уже уведомил' только после 3 подряд
-        # чистых тиков (~30 сек). Слабый шаблон может мерцать вокруг порога
-        # (0.84 -> 0.86 -> 0.84...) — без гистерезиса каждое мигание сбрасывало
-        # флаг и следующее совпадение слало НОВОЕ уведомление (спам).
-        self.last_state = "alive"
-        self._clear_ticks += 1
-        if self._clear_ticks >= 3:
-            self.death_notified = False
-            self.disconnect_notified = False
+        # ── Замок дисконнекта ──
+        if disconnect_active:
+            self._clear_ticks_disconnect = 0
+            if not self.disconnect_notified:
+                self.disconnect_notified = True
+                await notify_fn("disconnect", self.char_name, self.version, self.hwnd)
+        elif disconnect_clean:
+            # Таблички точно нет — копим чистые тики и открываем замок.
+            self._clear_ticks_disconnect += 1
+            if self._clear_ticks_disconnect >= CLEAR_TICKS_REQUIRED:
+                self.disconnect_notified = False
+        else:
+            # Серая зона: совпадение просело ниже порога, но табличка,
+            # скорее всего, ВСЁ ЕЩЁ на экране (мерцание шаблона). Замок
+            # не открываем и счётчик обнуляем — иначе следующий всплеск
+            # выше порога уйдёт как новое уведомление (это и был спам).
+            self._clear_ticks_disconnect = 0
+
+        # ── Замок смерти ──
+        if death_active:
+            self._clear_ticks_death = 0
+            if not self.death_notified:
+                self.death_notified = True
+                await notify_fn("death", self.char_name, self.version, self.hwnd)
+        elif disconnect_active:
+            # Табличка дисконнекта висит ПОВЕРХ окна смерти и частично его
+            # закрывает — совпадение шаблона смерти проваливается, хотя
+            # персонаж всё ещё мёртв. Судить о смерти в этот момент нельзя:
+            # замораживаем замок как есть. Иначе после закрытия таблички
+            # дисконнекта окно смерти "появлялось" заново и слало лишний пинг.
+            self._clear_ticks_death = 0
+        elif death_clean:
+            self._clear_ticks_death += 1
+            if self._clear_ticks_death >= CLEAR_TICKS_REQUIRED:
+                self.death_notified = False
+        else:
+            self._clear_ticks_death = 0
+
+        # ── Реальное состояние для /status ──
+        # Дисконнект приоритетнее: он перекрывает экран целиком.
+        # В серой зоне состояние НЕ меняем — оставляем прежнее, чтобы
+        # /status не показывал "Активен" для реально лежащего персонажа.
+        if disconnect_active:
+            self.last_state = "disconnect"
+        elif death_active:
+            self.last_state = "dead"
+        elif disconnect_clean and death_clean:
+            self.last_state = "alive"
 
 
 class WindowRegistry:

@@ -72,7 +72,7 @@ echo     Done.
 echo.
 
 echo     Preparing icon...
-python -c "from PIL import Image; Image.open('tray_icon.png').save('app_icon.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])" >> build_log.txt 2>&1
+python -c "from PIL import Image; Image.open('tray_icon.png').convert('RGBA').save('app_icon.ico', sizes=[(16,16),(32,32),(48,48),(256,256)])" >> build_log.txt 2>&1
 if exist "app_icon.ico" (
     set ICON_FLAG=--icon app_icon.ico
     echo     Icon ready.
@@ -93,6 +93,7 @@ python -m PyInstaller ^
     --name "L2Watcher" ^
     %ICON_FLAG% ^
     --add-data "tray_icon.png;." ^
+    --add-data "app_icon.ico;." ^
     --hidden-import "pystray._win32" ^
     --hidden-import "sv_ttk" ^
     --hidden-import "PIL._tkinter_finder" ^
