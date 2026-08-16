@@ -307,7 +307,13 @@ class OnboardingFlow:
             confirmed = await self._confirm_template(template, f"смерть ({version_label})")
             if confirmed:
                 key = f"{version}_death"
-                if save_template(key, template):
+                # Запоминаем размер окна, на котором обучались: если потом
+                # играть в окне поменьше, шаблон физически не влезет в кадр
+                # и детект молча перестанет работать. По этой записи /health
+                # честно скажет "переобучи" вместо того чтобы просто молчать.
+                win_size = ((baseline.shape[1], baseline.shape[0])
+                            if baseline is not None else None)
+                if save_template(key, template, window_size=win_size):
                     await self.tg.send(f"✅ Шаблон смерти ({version_label}) обучён и сохранён!")
                     return True
                 else:
@@ -371,7 +377,9 @@ class OnboardingFlow:
             confirmed = await self._confirm_template(template, f"дисконнект ({version_label})")
             if confirmed:
                 key = f"{version}_disconnect"
-                if save_template(key, template):
+                win_size = ((baseline.shape[1], baseline.shape[0])
+                            if baseline is not None else None)
+                if save_template(key, template, window_size=win_size):
                     await self.tg.send(f"✅ Шаблон дисконнекта ({version_label}) обучён и сохранён!")
                     return True
                 else:

@@ -99,6 +99,21 @@ class TrayIcon:
         if self.on_exit:
             self.on_exit()
 
+    def notify(self, message: str, title: str = None):
+        """
+        Всплывающее уведомление Windows у иконки трея.
+
+        Нужно, чтобы о смерти было слышно и видно даже когда Telegram
+        недоступен (блокировки, отвалившийся VPN). Средствами pystray —
+        отдельная библиотека для тостов не нужна.
+        """
+        if self._icon is None:
+            return
+        try:
+            self._icon.notify(message, title)
+        except Exception as e:
+            logger.debug(f"Всплывающее уведомление не показано: {e}")
+
     def run_in_background(self):
         """Запускает трей в отдельном потоке — не блокирует основной asyncio event loop."""
         self._build_icon()

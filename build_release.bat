@@ -74,6 +74,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM ============================================================
+REM   SHA256 of the release zip.
+REM   Publish it in the GitHub release notes: the exe is unsigned
+REM   (a signing certificate costs 100+ USD/year and does not pay
+REM   off here), so a published hash + VirusTotal link is what
+REM   lets people check the download is genuine.
+REM ============================================================
+echo.
+echo [release] SHA256 of %ZIPNAME%:
+REM Без экранированных кавычек внутри -Command: cmd передаёт их в PowerShell
+REM как попало, и строка ломается. Собираем текст конкатенацией.
+powershell -NoProfile -Command "$h=(Get-FileHash '%ZIPNAME%' -Algorithm SHA256).Hash; Write-Output $h; $h + '  %ZIPNAME%' | Set-Content -Path '%ZIPNAME%.sha256.txt' -Encoding utf8"
+echo     saved to %ZIPNAME%.sha256.txt
+echo.
+echo     Next: upload %ZIPNAME% to https://www.virustotal.com/gui/home/upload
+echo     and put BOTH the hash and the VirusTotal link into the release notes.
+
 echo.
 echo [release] Restoring dev files into dist (feedback receiver)...
 if exist "feedback_config.json" (

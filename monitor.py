@@ -29,6 +29,13 @@ RESET_MARGIN = 0.20
 # (~30 сек при тике в 12 сек).
 CLEAR_TICKS_REQUIRED = 3
 
+# Сколько СЕКУНД подряд событие должно ЯВНО отсутствовать, чтобы замок
+# открылся. Считаем в секундах, а НЕ в тиках: check_interval меняется
+# пользователем в настройках, и на маленьком интервале (1-2 сек) счётчик
+# из 3 тиков открывал замок за 3 секунды — возвращался спам, который
+# чинили в 1.0.3. В секундах поведение одинаковое при любом интервале.
+CLEAR_SECONDS_REQUIRED = 30
+
 
 class GameWindow:
     """Состояние одного отслеживаемого окна игры."""
@@ -40,11 +47,17 @@ class GameWindow:
 
         self.death_notified = False
         self.disconnect_notified = False
-        # Счётчики чистых тиков ОТДЕЛЬНО для каждого события. Раньше был
-        # один общий, из-за чего замки смерти и дисконнекта открывались
-        # вместе, хотя события независимы.
-        self._clear_ticks_death = 0
-        self._clear_ticks_disconnect = 0
+        # Момент начала непрерывной "чистоты" ОТДЕЛЬНО для каждого события
+        # (None = сейчас не чисто). Замки независимы: раньше был один общий
+        # счётчик, из-за чего замки смерти и дисконнекта открывались вместе,
+        # хотя события разные. Храним время, а не число тиков — см.
+        # CLEAR_SECONDS_REQUIRED.
+        self._clear_since_death = None
+        self._clear_since_disconnect = None
+
+        # Размер окна на последнем удачном тике — для /health и диагностики
+        # "почему не ловится" (окно меньше шаблона).
+        self.last_frame_size = None
 
         # Реальное состояние на последнем тике — для /status. В отличие от
         # *_notified флагов (которые завязаны на combined-логику "одно
@@ -74,6 +87,24 @@ class GameWindow:
     ) -> float:
         """Возвращает реальный score совпадения (для логов и решений)."""
         try:
+            # КРИТИЧНО: если кадр МЕНЬШЕ шаблона, cv2.matchTemplate НЕ падает,
+            # а молча меняет картинки местами и ищет кадр внутри шаблона —
+            # и почти всегда возвращает 1.000. Это давало ложные "смерть" и
+            # "дисконнект", после чего замок закрывался навсегда и настоящее
+            # событие уже не приходило. В логах ловилось как "совпадение 1.000"
+            # десятками тиков подряд. Ловится когда окно свёрнуто (крошечный
+            # WindowRect), разворачивается, или шаблон обучен на большем
+            # разрешении, чем текущее окно.
+            th, tw = template.shape[:2]
+            fh, fw = frame.shape[:2]
+            if th > fh or tw > fw:
+                logger.warning(
+                    f"[{self.label}] {name}: окно {fw}x{fh} МЕНЬШЕ шаблона "
+                    f"{tw}x{th} — тик пропущен (окно свёрнуто или шаблон "
+                    f"обучен на большем разрешении; переобучи через /retrain)"
+                )
+                return 0.0
+
             result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, _ = cv2.minMaxLoc(result)
             # Обычные тики (персонаж жив, score низкий) — на DEBUG, чтобы не
@@ -95,34 +126,28 @@ class GameWindow:
             logger.error(f"Ошибка template matching [{self.label}] {name}: {e}")
             return 0.0
 
-    async def check(
+    def analyze(
         self,
         templates: Dict[str, Optional[np.ndarray]],
         thresholds: Dict[str, float],
-        notify_fn: Callable[..., Awaitable[None]],
-    ):
+    ) -> Optional[dict]:
         """
-        Главная проверка состояния окна за один тик.
-        notify_fn(event_text, label) — асинхронная функция отправки уведомления.
+        ТЯЖЁЛАЯ часть тика: захват окна + сравнение с шаблонами.
+        Синхронная и вынесена отдельно специально — её вызывают через
+        asyncio.to_thread, чтобы cv2.matchTemplate не блокировал event loop.
+        Раньше сравнение крутилось прямо в цикле, и на нескольких окнах
+        Telegram-бот заметно тормозил с ответами.
 
-        Смерть и дисконнект — НЕЗАВИСИМЫЕ события, у каждого свой "замок":
-          • событие появилось на экране → один пинг, замок закрывается;
-          • событие продолжает висеть на экране → молчим;
-          • событие точно исчезло с экрана → замок открывается молча;
-          • событие появилось снова позже → снова один пинг.
-        Раньше замок был общий (already_notified): смерть глушила
-        последующий дисконнект, хотя это ДРУГОЙ статус и о нём нужно знать.
+        Возвращает словарь флагов или None, если окна/кадра нет.
         """
-        # Закрытие окна обрабатывается НЕ здесь, а в главном цикле через
-        # registry.get_closed() — он шлёт одно уведомление и убирает окно
-        # из реестра. Если бы проверка закрытия была и тут, закрытое окно
-        # слало бы уведомление на каждом тике, пока цикл его не уберёт.
         if not win32gui.IsWindow(self.hwnd):
-            return
+            return None
 
         frame = self.capture()
         if frame is None:
-            return
+            return None
+
+        self.last_frame_size = (frame.shape[1], frame.shape[0])  # (ширина, высота)
 
         # ── Дисконнект ──
         # Шаблон выбирается по версии окна (main/essence) — таблички разрыва
@@ -149,27 +174,76 @@ class GameWindow:
             death_active = score >= death_threshold
             death_clean = score < death_threshold - RESET_MARGIN
 
+        return {
+            "death_active": death_active,
+            "death_clean": death_clean,
+            "disconnect_active": disconnect_active,
+            "disconnect_clean": disconnect_clean,
+        }
+
+    def _lock_expired(self, since) -> bool:
+        """True, если событие отсутствует непрерывно уже CLEAR_SECONDS_REQUIRED."""
+        if since is None:
+            return False
+        return (datetime.now() - since).total_seconds() >= CLEAR_SECONDS_REQUIRED
+
+    async def check(
+        self,
+        templates: Dict[str, Optional[np.ndarray]],
+        thresholds: Dict[str, float],
+        notify_fn: Callable[..., Awaitable[None]],
+    ):
+        """
+        Главная проверка состояния окна за один тик.
+        notify_fn(event_text, label) — асинхронная функция отправки уведомления.
+
+        Смерть и дисконнект — НЕЗАВИСИМЫЕ события, у каждого свой "замок":
+          • событие появилось на экране → один пинг, замок закрывается;
+          • событие продолжает висеть на экране → молчим;
+          • событие точно исчезло с экрана → замок открывается молча;
+          • событие появилось снова позже → снова один пинг.
+        Раньше замок был общий (already_notified): смерть глушила
+        последующий дисконнект, хотя это ДРУГОЙ статус и о нём нужно знать.
+        """
+        # Закрытие окна обрабатывается НЕ здесь, а в главном цикле через
+        # registry.get_closed() — он шлёт одно уведомление и убирает окно
+        # из реестра. Если бы проверка закрытия была и тут, закрытое окно
+        # слало бы уведомление на каждом тике, пока цикл его не уберёт.
+        import asyncio
+        res = await asyncio.to_thread(self.analyze, templates, thresholds)
+        if res is None:
+            return
+
+        death_active = res["death_active"]
+        death_clean = res["death_clean"]
+        disconnect_active = res["disconnect_active"]
+        disconnect_clean = res["disconnect_clean"]
+
+        now = datetime.now()
+
         # ── Замок дисконнекта ──
         if disconnect_active:
-            self._clear_ticks_disconnect = 0
+            self._clear_since_disconnect = None
             if not self.disconnect_notified:
                 self.disconnect_notified = True
                 await notify_fn("disconnect", self.char_name, self.version, self.hwnd)
         elif disconnect_clean:
-            # Таблички точно нет — копим чистые тики и открываем замок.
-            self._clear_ticks_disconnect += 1
-            if self._clear_ticks_disconnect >= CLEAR_TICKS_REQUIRED:
+            # Таблички точно нет — засекаем непрерывную чистоту и открываем
+            # замок, когда её накопилось CLEAR_SECONDS_REQUIRED секунд.
+            if self._clear_since_disconnect is None:
+                self._clear_since_disconnect = now
+            if self._lock_expired(self._clear_since_disconnect):
                 self.disconnect_notified = False
         else:
             # Серая зона: совпадение просело ниже порога, но табличка,
             # скорее всего, ВСЁ ЕЩЁ на экране (мерцание шаблона). Замок
-            # не открываем и счётчик обнуляем — иначе следующий всплеск
-            # выше порога уйдёт как новое уведомление (это и был спам).
-            self._clear_ticks_disconnect = 0
+            # не открываем и отсчёт чистоты сбрасываем — иначе следующий
+            # всплеск выше порога уйдёт как новое уведомление (это был спам).
+            self._clear_since_disconnect = None
 
         # ── Замок смерти ──
         if death_active:
-            self._clear_ticks_death = 0
+            self._clear_since_death = None
             if not self.death_notified:
                 self.death_notified = True
                 await notify_fn("death", self.char_name, self.version, self.hwnd)
@@ -179,13 +253,14 @@ class GameWindow:
             # персонаж всё ещё мёртв. Судить о смерти в этот момент нельзя:
             # замораживаем замок как есть. Иначе после закрытия таблички
             # дисконнекта окно смерти "появлялось" заново и слало лишний пинг.
-            self._clear_ticks_death = 0
+            self._clear_since_death = None
         elif death_clean:
-            self._clear_ticks_death += 1
-            if self._clear_ticks_death >= CLEAR_TICKS_REQUIRED:
+            if self._clear_since_death is None:
+                self._clear_since_death = now
+            if self._lock_expired(self._clear_since_death):
                 self.death_notified = False
         else:
-            self._clear_ticks_death = 0
+            self._clear_since_death = None
 
         # ── Реальное состояние для /status ──
         # Дисконнект приоритетнее: он перекрывает экран целиком.
@@ -211,31 +286,37 @@ class WindowRegistry:
     def due_for_check(self) -> bool:
         return (datetime.now() - self._last_check).total_seconds() >= self.window_check_interval
 
-    def refresh(self) -> List[int]:
+    # ПРИМЕЧАНИЕ: три метода ниже принимают уже готовый список окон
+    # (current). Раньше каждый сам звал get_l2_hwnds(), и за один тик
+    # Windows перебирала ВСЕ окна системы трижды подряд. Теперь главный
+    # цикл делает это один раз и передаёт результат сюда.
+
+    def refresh(self, current: List[int] = None) -> List[int]:
         """Возвращает список НОВЫХ hwnd, обнаруженных с последней проверки.
         Окна, для которых регистрация уже запущена (ждём ответ в Telegram),
         повторно не возвращаются — иначе плодились бы дублирующие запросы."""
         self._last_check = datetime.now()
-        current = get_l2_hwnds()
+        if current is None:
+            current = get_l2_hwnds()
         new_hwnds = [h for h in current if h not in self.windows and h not in self._pending]
         for h in new_hwnds:
             self._pending.add(h)
         return new_hwnds
 
-    def get_closed(self) -> List[int]:
+    def get_closed(self, current: List[int] = None) -> List[int]:
         """Возвращает hwnd окон из реестра, которые больше не существуют."""
-        current = set(get_l2_hwnds())
-        return [h for h in self.windows if h not in current]
+        cur = set(get_l2_hwnds() if current is None else current)
+        return [h for h in self.windows if h not in cur]
 
-    def get_closed_pending(self) -> List[int]:
+    def get_closed_pending(self, current: List[int] = None) -> List[int]:
         """
         Возвращает hwnd окон, которые ждали регистрации (_pending), но
         закрылись, не дождавшись выбора персонажа. Их нужно убрать из
         _pending и отменить связанные кнопки/ожидание в Telegram — иначе
         кнопки выбора висят в чате вечно, ссылаясь на несуществующее окно.
         """
-        current = set(get_l2_hwnds())
-        closed = [h for h in self._pending if h not in current]
+        cur = set(get_l2_hwnds() if current is None else current)
+        closed = [h for h in self._pending if h not in cur]
         for h in closed:
             self._pending.discard(h)
         return closed

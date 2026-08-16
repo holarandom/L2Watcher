@@ -70,11 +70,62 @@ DEFAULT_CONFIG = {
         "start": "02:00",            # начало (ЧЧ:ММ)
         "end": "10:00"               # конец (ЧЧ:ММ); если start>end — через полночь
     },
-    "read_overlapped_windows": False  # читать перекрытые окна (PrintWindow):
-                                      # вкл = можно мультибоксить с перекрытием
-                                      # окон, но больше нагрузка на процессор.
-                                      # Свёрнутые окна не читаются в любом случае.
+    "read_overlapped_windows": False,  # читать перекрытые окна (PrintWindow):
+                                       # вкл = можно мультибоксить с перекрытием
+                                       # окон, но больше нагрузка на процессор.
+                                       # Свёрнутые окна не читаются в любом случае.
+    "local_sound": True,   # звук на самом компьютере при событии
+    "local_popup": True,   # всплывашка Windows у иконки трея
+                           # Оба работают без интернета — на случай, когда
+                           # Telegram недоступен (блокировки, отвал VPN).
 }
+
+
+# ── Шифрование токена ────────────────────────────────────────────────
+# Токен бота — это полный доступ к боту: кто его получил, тот может читать
+# твои уведомления и писать от его имени. Раньше он лежал в config.json
+# открытым текстом, и любая программа на компьютере могла его прочитать.
+#
+# Шифруем через Windows DPAPI: ключ хранит сама Windows и привязывает его
+# к учётной записи пользователя. Файл, скопированный на другой компьютер
+# или открытый под другой учёткой, не расшифруется. Ничего не стоит и не
+# требует ни пароля, ни новых библиотек (pywin32 уже используется).
+_TOKEN_PREFIX = "dpapi:"
+
+
+def _encrypt_token(plain: str) -> str:
+    """Шифрует токен. При любой неудаче возвращает как есть — приложение
+    важнее красоты: лучше работать с открытым токеном, чем не работать."""
+    if not plain or plain.startswith(_TOKEN_PREFIX):
+        return plain
+    try:
+        import base64
+        import win32crypt
+        blob = win32crypt.CryptProtectData(plain.encode("utf-8"), "L2Monitor token",
+                                           None, None, None, 0)
+        return _TOKEN_PREFIX + base64.b64encode(blob).decode("ascii")
+    except Exception as e:
+        logger.warning(f"Не удалось зашифровать токен, сохраняю как есть: {e}")
+        return plain
+
+
+def _decrypt_token(stored: str) -> str:
+    """Расшифровывает токен. Незашифрованный (со старых версий) отдаёт как есть."""
+    if not stored or not stored.startswith(_TOKEN_PREFIX):
+        return stored
+    try:
+        import base64
+        import win32crypt
+        blob = base64.b64decode(stored[len(_TOKEN_PREFIX):])
+        _desc, data = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+        return data.decode("utf-8")
+    except Exception as e:
+        logger.error(
+            f"Не удалось расшифровать токен: {e}. Такое бывает, если папку "
+            "настроек скопировали с другого компьютера или из другой учётной "
+            "записи Windows. Введи токен заново в настройках."
+        )
+        return ""
 
 
 def load_config() -> dict:
@@ -96,6 +147,10 @@ def load_config() -> dict:
         merged_qh = dict(DEFAULT_CONFIG["quiet_hours"])
         merged_qh.update(cfg.get("quiet_hours", {}))
         merged["quiet_hours"] = merged_qh
+        # В памяти приложение всегда работает с открытым токеном, шифрование
+        # живёт только на диске. Токены со старых версий (без префикса)
+        # читаются как есть и зашифруются при первом сохранении.
+        merged["token"] = _decrypt_token(merged.get("token", ""))
         return merged
     except Exception as e:
         logger.error(f"Ошибка чтения конфига: {e}. Использую дефолтный.")
@@ -105,8 +160,12 @@ def load_config() -> dict:
 def save_config(cfg: dict) -> bool:
     path = get_config_path()
     try:
+        # Копия, чтобы не подменить токен в живом словаре приложения —
+        # оно продолжает работать с открытым значением.
+        to_write = dict(cfg)
+        to_write["token"] = _encrypt_token(cfg.get("token", ""))
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(to_write, f, ensure_ascii=False, indent=2)
         logger.info(f"Конфиг сохранён: {path}")
         return True
     except Exception as e:

@@ -30,7 +30,57 @@ class TelegramNotifier:
         self._status_provider = None
         self._is_running_provider = None  # узнаёт у main.py реальное состояние
 
+        # Очередь недоставленных: если Telegram недоступен, событие не
+        # теряется, а лежит на диске и досылается, когда связь вернётся.
+        from notify_outbox import Outbox
+        self.outbox = Outbox()
+
+        # Локальные уведомления (звук + всплывашка Windows). Ставится
+        # приложением через set_local_notifier — работают даже когда
+        # Telegram недоступен полностью.
+        self.local = None
+
+        self._install_access_filter()
         self._register_handlers()
+
+    def _install_access_filter(self):
+        """
+        Пускает к боту ТОЛЬКО тот чат, который указан в настройках.
+
+        Без этого любой посторонний, нашедший бота по имени, мог слать ему
+        команды: /stop (тихо выключить чужой мониторинг — человек умрёт и
+        не узнает), /retrain (снести рабочие шаблоны), /status и /health
+        (узнать ники персонажей). Фильтр вешаем на весь диспетчер разом,
+        поэтому обработчики ниже трогать не нужно — aiogram отбросит чужое
+        до них.
+
+        Сравниваем именно chat.id, а не from_user.id: так работает и личка
+        (там chat.id == id пользователя), и группа (chat.id == id группы).
+        """
+        try:
+            allowed = int(str(self.chat_id).strip())
+        except (TypeError, ValueError):
+            # chat_id вида "@channelname" — числом не сравнить. Лучше
+            # оставить как было, чем сломать доставку, но предупредим.
+            logger.warning(
+                "chat_id не число — ограничение доступа к боту не включено. "
+                "Укажи числовой chat_id в настройках."
+            )
+            return
+
+        def _from_owner(event) -> bool:
+            chat = getattr(event, "chat", None)
+            if chat is None:
+                msg = getattr(event, "message", None)  # callback_query
+                chat = getattr(msg, "chat", None)
+            return chat is not None and chat.id == allowed
+
+        self.dp.message.filter(_from_owner)
+        self.dp.callback_query.filter(_from_owner)
+        logger.info(f"Доступ к боту ограничен чатом {allowed}")
+
+    def set_local_notifier(self, notifier):
+        self.local = notifier
 
     def _register_handlers(self):
         @self.dp.callback_query(lambda c: c.data == "noop")
@@ -130,6 +180,30 @@ class TelegramNotifier:
         Шлёт уведомление о событии, отформатированное по текущему стилю.
         event_type: "death" | "disconnect" | "window_closed".
         Под смертью/дисконнектом — кнопки Скрин и Статус (если есть hwnd).
+
+        Локальное уведомление (звук + всплывашка) показывается СРАЗУ и
+        независимо от сети. Если Telegram не ответил — событие уходит в
+        очередь на диске и досылается позже, а НЕ теряется, как раньше.
+        """
+        # Сначала локально: это мгновенно, бесплатно и не зависит от того,
+        # доступен ли вообще api.telegram.org.
+        if self.local is not None:
+            try:
+                self.local.notify(event_type, char_name, version)
+            except Exception as e:
+                logger.debug(f"Локальное уведомление не показано: {e}")
+
+        ok = await self._deliver(event_type, char_name, version, hwnd, time_str)
+        if not ok:
+            self.outbox.add(event_type, char_name, version, hwnd)
+
+    async def _deliver(self, event_type: str, char_name: str, version: str,
+                       hwnd: int = None, time_str: str = "",
+                       delayed: bool = False) -> bool:
+        """
+        Одна попытка доставки (с тремя ретраями внутри).
+        Возвращает True, если сообщение ушло. Используется и для свежих
+        событий, и для досылки из очереди.
         """
         import message_styles
         from datetime import datetime
@@ -139,6 +213,11 @@ class TelegramNotifier:
         msg = message_styles.format_event(
             self.message_style, event_type, char_name, version, time_str
         )
+        if delayed:
+            # Честно помечаем, что это «догоняющее» уведомление — иначе
+            # человек решит, что персонаж умер прямо сейчас.
+            msg += ("\n\n⏳ <i>Задержано: не было связи с Telegram, "
+                    "событие произошло в " + time_str + "</i>")
 
         from aiogram.utils.keyboard import InlineKeyboardBuilder
         b = InlineKeyboardBuilder()
@@ -150,18 +229,57 @@ class TelegramNotifier:
 
         # Уведомление о событии важно (смерть/дисконнект) — пробуем несколько
         # раз с паузой, чтобы кратковременный обрыв сети (моргнул VPN) не
-        # потерял событие.
+        # задержал его на целый цикл досылки.
         for attempt in range(3):
             try:
                 await self.bot.send_message(self.chat_id, msg, reply_markup=reply_markup)
-                logger.info(f"Уведомление [{event_type}]: {char_name} ({version})")
-                return
+                logger.info(f"Уведомление [{event_type}]: {char_name} ({version})"
+                            + (" (досылка)" if delayed else ""))
+                return True
             except Exception as e:
                 if attempt < 2:
                     logger.warning(f"Не отправилось уведомление (попытка {attempt+1}/3): {e}")
                     await asyncio.sleep(3)
                 else:
-                    logger.error(f"Уведомление [{event_type}] не доставлено после 3 попыток: {e}")
+                    logger.error(f"Уведомление [{event_type}] не ушло после 3 попыток: {e}")
+        return False
+
+    async def shutdown(self):
+        """
+        Аккуратно закрывает соединение с Telegram перед выходом.
+
+        Раньше приложение выходило через os._exit(0) — процесс умирал, не
+        закрыв HTTP-сессию, и Telegram ещё некоторое время считал, что
+        getUpdates держит кто-то живой. При быстром перезапуске это давало
+        "Conflict: terminated by other getUpdates" — в логах 119 таких, ВСЕ
+        сразу после старта приложения.
+        """
+        try:
+            await self.dp.stop_polling()
+        except Exception as e:
+            logger.debug(f"stop_polling при выходе: {e}")
+        try:
+            await self.bot.session.close()
+        except Exception as e:
+            logger.debug(f"Закрытие сессии при выходе: {e}")
+
+    async def outbox_loop(self, interval: int = 30):
+        """
+        Фоновая досылка отложенных событий.
+
+        Диск не трогаем вхолостую: пока очередь пуста, цикл только смотрит
+        на пустой список в памяти и засыпает дальше. Файл читается один раз
+        при старте и переписывается только когда очередь реально изменилась.
+        """
+        while True:
+            try:
+                if not self.outbox.is_empty():
+                    async def _send(ev, name, ver, hwnd, ts):
+                        return await self._deliver(ev, name, ver, hwnd, ts, delayed=True)
+                    await self.outbox.flush(_send)
+            except Exception as e:
+                logger.debug(f"Цикл досылки: {e}")
+            await asyncio.sleep(interval)
 
     async def send(self, text: str, reply_markup=None):
         try:
@@ -388,7 +506,9 @@ class TelegramNotifier:
         backoff = 5          # пауза перед повтором, сек
         max_backoff = 60     # потолок паузы
 
+        import time
         while True:
+            started_at = time.monotonic()
             try:
                 # handle_signals=False нужен, т.к. polling может работать не в
                 # главном потоке (там нельзя ставить обработчики сигналов).
@@ -403,13 +523,19 @@ class TelegramNotifier:
                 logger.info("Polling остановлен (отмена)")
                 raise
             except Exception as e:
+                # Сбрасываем паузу, если polling ПРОРАБОТАЛ заметное время
+                # (значит связь была и это новый, отдельный обрыв). Раньше
+                # backoff не сбрасывался никогда и после долгой работы
+                # накопленная минута держалась вечно, а при частых коротких
+                # обрывах бот долбил Telegram и ловил Flood control
+                # (26 раз в логах). Теперь: связь была >60 сек — начинаем
+                # отсчёт заново.
+                if time.monotonic() - started_at > 60:
+                    backoff = 5
                 logger.error(
                     f"Связь с Telegram потеряна ({type(e).__name__}). "
                     f"Повтор через {backoff} сек..."
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
-                # Когда сеть вернётся, start_polling на след. итерации
-                # поднимется заново. После успешного старта backoff не
-                # сбрасываем здесь — он сбросится логикой ниже при работе.
                 continue

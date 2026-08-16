@@ -100,8 +100,14 @@ python -m PyInstaller ^
     --hidden-import "win32gui" ^
     --hidden-import "win32ui" ^
     --hidden-import "win32con" ^
+    --hidden-import "win32crypt" ^
     --hidden-import "aiogram" ^
     --hidden-import "aiohttp" ^
+    --hidden-import "_tkinter" ^
+    --hidden-import "tkinter" ^
+    --hidden-import "tkinter.ttk" ^
+    --hidden-import "tkinter.messagebox" ^
+    --hidden-import "tkinter.filedialog" ^
     --collect-all "sv_ttk" ^
     --collect-submodules "aiogram" ^
     main.py >> build_log.txt 2>&1
@@ -113,6 +119,47 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+REM ============================================================
+REM   Post-build check: tkinter must be really bundled.
+REM   Without this the build "succeeds" but the Settings window
+REM   crashes with "Tcl data directory ... _tcl_data not found",
+REM   and you only find out after shipping it to users.
+REM ============================================================
+echo.
+echo     Verifying tkinter is bundled...
+set TK_OK=1
+if not exist "dist\L2Watcher\_internal\_tcl_data" set TK_OK=0
+if not exist "dist\L2Watcher\_internal\_tk_data"  set TK_OK=0
+REM ВНИМАНИЕ: внутри блока if (...) НЕЛЬЗЯ писать голую закрывающую скобку
+REM в echo — cmd примет её за конец блока и свалится с "was unexpected at
+REM this time", оборвав весь скрипт. Поэтому нумерация точками, а не "1)".
+if "%TK_OK%"=="0" (
+    echo.
+    echo ============================================================
+    echo   [ERROR] tkinter was NOT bundled into the build.
+    echo.
+    echo   The app will start, but the Settings window will crash
+    echo   with: Tcl data directory ..._internal\_tcl_data not found
+    echo.
+    echo   Most common causes:
+    echo     1. L2 Watcher was RUNNING during the build. Close it
+    echo        completely via tray icon - Exit, then rebuild.
+    echo     2. Antivirus quarantined tcl86t.dll / tk86t.dll.
+    echo        Check the AV quarantine and whitelist this folder.
+    echo     3. Leftovers in dist. Delete build\ and dist\, rebuild.
+    echo ============================================================
+    echo.
+    pause
+    exit /b 1
+)
+echo     tkinter OK.
+
+REM -- SHA256 of the exe: publish it next to the release so users --
+REM -- can verify the download was not tampered with.             --
+echo.
+echo     SHA256 of L2Watcher.exe:
+powershell -NoProfile -Command "(Get-FileHash 'dist\L2Watcher\L2Watcher.exe' -Algorithm SHA256).Hash"
 
 echo.
 echo ========================================

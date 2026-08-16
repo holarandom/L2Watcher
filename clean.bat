@@ -30,9 +30,13 @@ echo     6_*.png 7_*.png 8_*.png  (demo screenshots)
 echo.
 echo It will NOT touch:
 echo   - any .py source files
-echo   - tray_icon.png, template_*.png  (needed files)
-echo   - config.json, *.log
-echo   - dist\  (your built exe)
+echo   - tray_icon.png, template_*.png, l2watcher_*_256.png
+echo   - config.json, feedback_config.json, *.log
+echo   - docs\, .git\
+echo   - exp\ and exp_module.zip   (PRIVATE MODULE - never touched)
+echo.
+echo After this it will ASK SEPARATELY about heavy leftovers
+echo (old release zips, unpacked builds, dist\, UI mockups).
 echo.
 set /p CONFIRM="Type Y and press Enter to clean (anything else cancels): "
 if /i not "%CONFIRM%"=="Y" (
@@ -76,6 +80,77 @@ for %%F in ("6_*.png" "7_*.png" "8_*.png") do (
         del /q "%%~F"
         echo   removed %%~F
     )
+)
+
+echo.
+echo ========================================
+echo   Basic junk cleaned.
+echo ========================================
+echo.
+
+REM ============================================================
+REM   PART 2 - heavy leftovers. Asked separately because these
+REM   are big but not obviously junk: you may still want them.
+REM   Current version's zip is ALWAYS kept.
+REM ============================================================
+
+REM -- read current version from version.py --
+set CURVER=
+for /f "tokens=2 delims== " %%a in ('findstr /c:"APP_VERSION" version.py') do set CURVER=%%a
+set CURVER=%CURVER:"=%
+
+echo ========================================
+echo   Heavy leftovers
+echo ========================================
+echo.
+echo These take the most space. Old release zips are ~78 MB EACH
+echo and are already published on GitHub Releases - you can always
+echo download them back from there.
+echo.
+echo   L2Watcher_v*.zip     old release archives
+echo                        (KEEPING current: L2Watcher_v%CURVER%.zip)
+echo   L2Watcher_v*\         unpacked old builds
+echo   dist\                 last build output (rebuild anytime)
+echo   L2Watcher UI mockups.zip   design mockups (already applied)
+echo.
+echo NOT touched here either: exp\, exp_module.zip, docs\, .git\
+echo.
+set /p CONFIRM2="Type Y and press Enter to delete these too (anything else skips): "
+if /i not "%CONFIRM2%"=="Y" (
+    echo.
+    echo Skipped. Heavy files left in place.
+    echo.
+    pause
+    exit /b 0
+)
+
+echo.
+echo Cleaning heavy leftovers...
+
+REM ---- old release zips, keeping the current version ----
+for %%F in ("L2Watcher_v*.zip") do (
+    if /i not "%%~nxF"=="L2Watcher_v%CURVER%.zip" (
+        del /q "%%~F"
+        echo   removed %%~nxF
+    )
+)
+
+REM ---- unpacked old build folders ----
+for /d %%D in ("L2Watcher_v*") do (
+    rmdir /s /q "%%~D"
+    echo   removed %%~nxD\
+)
+
+REM ---- last build output ----
+if exist "dist" (
+    rmdir /s /q "dist"
+    echo   removed dist\
+)
+
+REM ---- design mockups ----
+if exist "L2Watcher UI mockups.zip" (
+    del /q "L2Watcher UI mockups.zip"
+    echo   removed L2Watcher UI mockups.zip
 )
 
 echo.

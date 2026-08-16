@@ -69,6 +69,7 @@ class L2MonitorApp:
         self._loop = None  # ссылка на главный asyncio loop (нужна потоку трея)
         self._capture_lock = None  # создаётся лениво при первом захвате
         self._training_hwnd = None  # окно, по которому идёт обучение (пропускается в мониторинге)
+        self.tray = None  # иконка трея (ставится из main() после запуска трея)
 
         self.tg.on_start(self._handle_start)
         self.tg.on_stop(self._handle_stop)
@@ -298,11 +299,15 @@ class L2MonitorApp:
         open_hwnds = get_l2_hwnds()
         lines.append(f"Окон Lineage II открыто: {len(open_hwnds)}")
 
-        # Окна, которые приложение отслеживает (назначены персонажи)
+        # Окна, которые приложение отслеживает (назначены персонажи).
+        # Размер окна показываем специально: если окно меньше шаблона,
+        # детект не работает — раньше это было невидимо и выглядело как
+        # "программа молчит без причины".
         tracked = self.registry.all()
         lines.append(f"Отслеживается (с именем): {len(tracked)}")
         for w in tracked:
-            lines.append(f"   • {w.label}")
+            size = f" — окно {w.last_frame_size[0]}x{w.last_frame_size[1]}" if w.last_frame_size else ""
+            lines.append(f"   • {w.label}{size}")
 
         # Загруженные шаблоны — по ним видно, что детект вообще возможен
         lines.append("\nШаблоны распознавания:")
@@ -313,8 +318,40 @@ class L2MonitorApp:
             "essence_disconnect": "Дисконнект (Essence)",
         }
         for key, label in labels.items():
-            mark = "✅" if has_template(key) else "❌ нет"
-            lines.append(f"   {mark} {label}")
+            if not has_template(key):
+                lines.append(f"   ❌ нет {label}")
+                continue
+            tmpl = self.templates.get(key)
+            size = f" ({tmpl.shape[1]}x{tmpl.shape[0]})" if tmpl is not None else ""
+            lines.append(f"   ✅ {label}{size}")
+
+        # Прямое предупреждение, если окно физически меньше шаблона —
+        # в этом случае событие не поймается никогда, пока не переобучить.
+        too_small = []
+        for w in tracked:
+            if not w.last_frame_size:
+                continue
+            fw, fh = w.last_frame_size
+            for kind in ("death", "disconnect"):
+                tmpl = self.templates.get(f"{w.version}_{kind}")
+                if tmpl is not None and (tmpl.shape[1] > fw or tmpl.shape[0] > fh):
+                    too_small.append(f"{w.label}: окно {fw}x{fh} < шаблон "
+                                     f"{tmpl.shape[1]}x{tmpl.shape[0]}")
+        if too_small:
+            lines.append("\n🚨 Окно МЕНЬШЕ шаблона — событие не поймается:")
+            for t in too_small:
+                lines.append(f"   • {t}")
+            lines.append("   Разверни окно на прежний размер или переобучи "
+                         "шаблон через 🔄 Переобучить.")
+
+        # Отложенные события (не ушли из-за обрыва связи)
+        try:
+            pending = self.tg.outbox.count()
+            if pending:
+                lines.append(f"\n⏳ Ждут отправки: {pending} событий "
+                             f"(дошлю, когда вернётся связь)")
+        except Exception:
+            pass
 
 
         # Подсказка если что-то не так
@@ -488,6 +525,17 @@ class L2MonitorApp:
         self._registration_tasks.clear()
         logger.info("Мониторинг остановлен")
 
+    @staticmethod
+    def _log_task_error(task):
+        """Достаёт исключение из фоновой задачи и пишет в лог с трассировкой.
+        Иначе asyncio ругается 'Task exception was never retrieved' и теряет
+        причину — чинить такое вслепую невозможно."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"Ошибка в фоновой задаче: {exc}", exc_info=exc)
+
     async def _monitor_loop(self):
         from config_manager import is_quiet_now
         self._was_quiet = False  # для отслеживания входа/выхода из тихого режима
@@ -541,8 +589,15 @@ class L2MonitorApp:
                 }
                 try:
                     if self.registry.due_for_check():
-                        new_hwnds = self.registry.refresh()
-                        closed_hwnds = self.registry.get_closed()
+                        # ОДИН перебор окон Windows на весь тик. Раньше
+                        # refresh/get_closed/get_closed_pending дёргали
+                        # EnumWindows каждый сам — три полных обхода всех
+                        # окон системы подряд на ровном месте.
+                        from window_capture import get_l2_hwnds
+                        current_hwnds = await asyncio.to_thread(get_l2_hwnds)
+
+                        new_hwnds = self.registry.refresh(current_hwnds)
+                        closed_hwnds = self.registry.get_closed(current_hwnds)
 
                         for hwnd in closed_hwnds:
                             w = self.registry.windows[hwnd]
@@ -557,7 +612,7 @@ class L2MonitorApp:
                         # Окна, которые закрылись, не дождавшись выбора
                         # персонажа — убираем висящие кнопки регистрации
                         # из чата и чистим ожидание (баг с "висящими плашками").
-                        for hwnd in self.registry.get_closed_pending():
+                        for hwnd in self.registry.get_closed_pending(current_hwnds):
                             await self.tg.cancel_registration(hwnd)
                             logger.info(f"Регистрация окна 0x{hwnd:X} отменена — окно закрылось")
 
@@ -566,6 +621,11 @@ class L2MonitorApp:
                             # запускается в фоне — не блокирует проверку уже
                             # зарегистрированных окон пока человек не ответит
                             task = asyncio.create_task(self._register_window_async(hwnd))
+                            # Без этого коллбэка ошибка внутри задачи тонула
+                            # молча: в логах ловилось как "Task exception was
+                            # never retrieved" без единой подробности, и было
+                            # непонятно, почему окно не зарегистрировалось.
+                            task.add_done_callback(self._log_task_error)
                             self._registration_tasks.append(task)
 
                         # Чистим завершённые задачи, чтобы список не рос бесконечно
@@ -597,13 +657,36 @@ class L2MonitorApp:
         # или отозван — бот не сможет ничего отправить, и без явной проверки
         # это выглядело бы как "приложение молча не работает". Показываем
         # понятное окно с подсказкой.
-        try:
-            me = await self.tg.bot.get_me()
-            logger.info(f"Бот авторизован: @{me.username}")
-        except Exception as e:
-            logger.error(f"Не удалось авторизоваться в Telegram: {e}")
-            self._show_token_error()
-            return
+        #
+        # ВАЖНО: отличаем битый токен от временно недоступной сети. Раньше
+        # ЛЮБАЯ ошибка здесь показывала "неверный токен" и приложение
+        # выходило совсем. У друга это срабатывало 4 раза подряд на
+        # ClientConnectorDNSError: интернет ещё не поднялся после включения
+        # компьютера (типично при автозагрузке), токен при этом был в
+        # порядке. Теперь сетевые ошибки просто ждут и повторяют.
+        from aiogram.exceptions import TelegramUnauthorizedError
+        for attempt in range(1, 11):
+            try:
+                me = await self.tg.bot.get_me()
+                logger.info(f"Бот авторизован: @{me.username}")
+                break
+            except TelegramUnauthorizedError as e:
+                # Вот это действительно битый/отозванный токен — ждать смысла нет
+                logger.error(f"Токен Telegram отвергнут: {e}")
+                self._show_token_error()
+                return
+            except Exception as e:
+                if attempt == 10:
+                    logger.error(
+                        f"Telegram недоступен после 10 попыток: {e}. "
+                        "Работаю дальше — polling переподключится сам."
+                    )
+                    break
+                logger.warning(
+                    f"Telegram пока недоступен (попытка {attempt}/10): "
+                    f"{type(e).__name__}. Жду 15 сек..."
+                )
+                await asyncio.sleep(15)
 
         # Проверяем какие шаблоны есть, но НЕ блокируем старт их отсутствием.
         # Мониторинг работает с тем, что есть: для окна без шаблона смерти
@@ -650,7 +733,13 @@ class L2MonitorApp:
 
         # Фоновая проверка обновлений (GitHub Releases, раз в сутки)
         from update_checker import update_check_loop
-        asyncio.create_task(update_check_loop(self))
+        t = asyncio.create_task(update_check_loop(self))
+        t.add_done_callback(self._log_task_error)
+
+        # Фоновая досылка событий, не ушедших из-за обрыва связи.
+        # Пока очередь пуста — к диску не обращается.
+        t2 = asyncio.create_task(self.tg.outbox_loop())
+        t2.add_done_callback(self._log_task_error)
 
         await self.tg.start_polling()
 
@@ -755,12 +844,32 @@ class L2MonitorApp:
         self.cfg["read_overlapped_windows"] = new_cfg.get("read_overlapped_windows",
                                                           self.cfg.get("read_overlapped_windows", False))
 
+        # Звук и всплывашка на компьютере — тоже на лету
+        for k in ("local_sound", "local_popup"):
+            self.cfg[k] = new_cfg.get(k, self.cfg.get(k, True))
+        if self.tg.local is not None:
+            self.tg.local.sound = self.cfg["local_sound"]
+            self.tg.local.popup = self.cfg["local_popup"]
+
         logger.info("Настройки перечитаны и применены на лету")
 
 
     def request_exit(self):
         """Корректно останавливает приложение (вызывается из трея 'Выход')."""
         logger.info("Завершение приложения по запросу из трея")
+
+        # Сначала закрываем сессию Telegram, и только потом убиваем процесс.
+        # Раньше сразу шёл os._exit(0): сессия getUpdates оставалась висеть
+        # на стороне Telegram, и следующий запуск ловил "Conflict: terminated
+        # by other getUpdates" (119 раз в логах, все сразу после старта).
+        # Ждём не дольше 5 секунд — выход не должен подвисать из-за сети.
+        try:
+            if self._loop is not None and self._loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(self.tg.shutdown(), self._loop)
+                fut.result(timeout=5)
+        except Exception as e:
+            logger.debug(f"Не удалось закрыть сессию Telegram при выходе: {e}")
+
         # Гасим приёмник фидбека (режим разработчика), если он был запущен —
         # иначе фоновый python.exe останется висеть и держать файлы в dist,
         # ломая следующую сборку.
@@ -893,6 +1002,18 @@ def main():
         log_path=get_log_path()
     )
     tray.run_in_background()
+
+    # Локальные уведомления (звук + всплывашка Windows). Работают, даже
+    # когда Telegram недоступен полностью — а он недоступен регулярно.
+    # Трей передаём функцией, а не объектом: иконка поднимается в отдельном
+    # потоке и на момент первого уведомления может быть ещё не готова.
+    from local_notify import LocalNotifier
+    app.tray = tray
+    app.tg.set_local_notifier(LocalNotifier(
+        tray_provider=lambda: tray,
+        sound=cfg.get("local_sound", True),
+        popup=cfg.get("local_popup", True),
+    ))
 
     asyncio.run(app.run())
 

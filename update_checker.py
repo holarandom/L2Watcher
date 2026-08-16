@@ -12,6 +12,7 @@
 import asyncio
 import json
 import logging
+import re
 import urllib.request
 
 from version import APP_VERSION
@@ -40,10 +41,12 @@ def _fetch_latest_version() -> str | None:
 def _newer(latest: str, current: str) -> bool:
     """True если latest > current (сравнение по числам SemVer)."""
     def parts(v):
-        try:
-            return [int(x) for x in v.split(".")]
-        except Exception:
-            return [0]
+        # Берём только ведущие числа: "1.0.4-beta" -> [1, 0, 4].
+        # Раньше любой нечисловой суффикс ронял разбор в [0], и тег вроде
+        # "1.0.4-beta" считался СТАРШЕ ничего — уведомление об обновлении
+        # не приходило вообще.
+        nums = re.findall(r"\d+", str(v).split("-")[0].split("+")[0])
+        return [int(x) for x in nums] or [0]
     a, b = parts(latest), parts(current)
     # выравниваем длину
     n = max(len(a), len(b))
