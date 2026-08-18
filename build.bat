@@ -51,6 +51,42 @@ if not exist "main.py" (
 echo     Files OK.
 echo.
 
+REM ============================================================
+REM   Running app check. This is THE most common cause of a
+REM   silently broken build: a running L2Watcher.exe locks files
+REM   in dist\, so "rmdir dist" quietly fails, PyInstaller cannot
+REM   overwrite the exe, tkinter data never gets written, and the
+REM   zip step later chokes on a locked base_library.zip.
+REM   The build "succeeds" and ships broken. Stop it right here.
+REM ============================================================
+echo     Checking that L2 Watcher is not running...
+tasklist /FI "IMAGENAME eq L2Watcher.exe" /NH 2>nul | find /I "L2Watcher.exe" >nul
+if not errorlevel 1 (
+    echo.
+    echo ============================================================
+    echo   [ERROR] L2Watcher.exe is RUNNING. Cannot build.
+    echo.
+    echo   A running app locks files in dist\ and the build would
+    echo   silently produce a BROKEN package.
+    echo.
+    echo   Close it properly: tray icon - right click - Exit.
+    echo   Or force it from here:
+    echo       taskkill /IM L2Watcher.exe /F
+    echo ============================================================
+    echo.
+    pause
+    exit /b 1
+)
+echo     Not running, OK.
+
+REM -- Leftover feedback receivers (dev mode). They are separate python --
+REM -- processes spawned by the app; taskkill on L2Watcher.exe does NOT --
+REM -- take them down. An orphan holds dist\ locked and the build dies  --
+REM -- with "file is used by another process".                          --
+echo     Stopping leftover feedback receivers...
+powershell -NoProfile -Command "$p=Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | Where-Object { $_.CommandLine -like '*feedback_receiver*' }; if ($p) { $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }; Write-Output ('     stopped: ' + $p.Count) } else { Write-Output '     none found' }"
+echo.
+
 echo [3/5] Installing libraries (may take a few minutes)...
 python -m pip install --upgrade pip >> build_log.txt 2>&1
 python -m pip install -r requirements.txt >> build_log.txt 2>&1
@@ -69,6 +105,19 @@ if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
 if exist "L2Watcher.spec" del /q "L2Watcher.spec"
 echo     Done.
+echo.
+
+echo     Preparing version metadata...
+REM Пустые свойства файла (издатель/продукт/версия) - отдельный минус в
+REM глазах ML-движка Defender. Генерируем метаданные из version.py.
+python make_version_file.py >> build_log.txt 2>&1
+if exist "file_version_info.txt" (
+    set VERSION_FLAG=--version-file file_version_info.txt
+    echo     Version metadata ready.
+) else (
+    set VERSION_FLAG=
+    echo     [WARN] Version metadata skipped - exe will have empty properties.
+)
 echo.
 
 echo     Preparing icon...
@@ -92,6 +141,8 @@ python -m PyInstaller ^
     --windowed ^
     --name "L2Watcher" ^
     %ICON_FLAG% ^
+    %VERSION_FLAG% ^
+    --noupx ^
     --add-data "tray_icon.png;." ^
     --add-data "app_icon.ico;." ^
     --hidden-import "pystray._win32" ^
@@ -101,6 +152,9 @@ python -m PyInstaller ^
     --hidden-import "win32ui" ^
     --hidden-import "win32con" ^
     --hidden-import "win32crypt" ^
+    --hidden-import "win32com.client" ^
+    --hidden-import "pythoncom" ^
+    --hidden-import "pywintypes" ^
     --hidden-import "aiogram" ^
     --hidden-import "aiohttp" ^
     --hidden-import "_tkinter" ^
@@ -155,6 +209,12 @@ if "%TK_OK%"=="0" (
 )
 echo     tkinter OK.
 
+REM -- Metadata check: empty file properties are one of the reasons --
+REM -- Defender's ML engine flags the build as Wacatac.            --
+echo.
+echo     Verifying exe metadata...
+powershell -NoProfile -Command "$v=(Get-Item 'dist\L2Watcher\L2Watcher.exe').VersionInfo; if ([string]::IsNullOrWhiteSpace($v.ProductName)) { Write-Output '     [WARN] exe properties are EMPTY - rebuild after checking make_version_file.py'; exit 1 } else { Write-Output ('     Product: ' + $v.ProductName + ' ' + $v.FileVersion + ' by ' + $v.CompanyName) }"
+
 REM -- SHA256 of the exe: publish it next to the release so users --
 REM -- can verify the download was not tampered with.             --
 echo.
@@ -187,3 +247,10 @@ if exist "dist\L2Watcher\L2Watcher.exe" (
 
 echo.
 pause
+
+REM ВАЖНО: явный успешный код возврата.
+REM explorer.exe всегда завершается с кодом 1, даже когда открыл папку
+REM нормально, а pause errorlevel не сбрасывает. Из-за этого build.bat
+REM отдавал наверх "1", и build_release.bat считал успешную сборку
+REM провалившейся и не доходил до упаковки архива.
+exit /b 0

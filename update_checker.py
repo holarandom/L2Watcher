@@ -65,6 +65,17 @@ async def update_check_loop(app):
         try:
             latest = await asyncio.to_thread(_fetch_latest_version)
             if latest and _newer(latest, APP_VERSION):
+                # Трею сообщаем ВСЕГДА, на каждом заходе: пункт меню
+                # «Скачать версию X» должен быть на месте и после
+                # перезапуска приложения, а не только один раз.
+                # Это единственный способ узнать об обновлении, когда
+                # Telegram недоступен.
+                try:
+                    if getattr(app, "tray", None) is not None:
+                        app.tray.set_update_available(latest)
+                except Exception as e:
+                    logger.debug(f"Трей не уведомлён об обновлении: {e}")
+
                 notified = app.cfg.get("update_notified_version", "")
                 if notified != latest:
                     app.cfg["update_notified_version"] = latest

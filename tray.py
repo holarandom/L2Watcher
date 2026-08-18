@@ -35,6 +35,9 @@ class TrayIcon:
         self.log_path = log_path
         self._icon = None
         self._thread = None
+        # Версия доступного обновления (None = обновления нет). Пункт меню
+        # "Скачать обновление" показывается только когда здесь что-то есть.
+        self._update_version = None
 
     def _build_icon(self):
         import pystray
@@ -55,7 +58,20 @@ class TrayIcon:
         # default-пункт меню. Раньше для этого использовался on_activate,
         # но он на Windows срабатывает ненадёжно и не на всех версиях
         # pystray — поэтому переехали на default-пункт.
+        # Пункт обновления: текст и видимость — функции, а не строки.
+        # pystray пересчитывает их при каждом открытии меню, поэтому пункт
+        # появляется сам, как только фоновая проверка нашла новую версию,
+        # и пересобирать меню не нужно.
+        #
+        # Зачем вообще: раньше об обновлении сообщал ТОЛЬКО Telegram-бот.
+        # Если Telegram недоступен (а он недоступен регулярно), человек про
+        # новую версию не узнавал вообще. Теперь она видна в самой программе.
         menu = pystray.Menu(
+            pystray.MenuItem(
+                lambda item: f"🆕 Скачать версию {self._update_version}",
+                self._handle_update,
+                visible=lambda item: self._update_version is not None,
+            ),
             pystray.MenuItem("Настройки", self._handle_settings, default=True),
             pystray.MenuItem("Открыть лог", self._handle_open_log),
             pystray.Menu.SEPARATOR,
@@ -98,6 +114,41 @@ class TrayIcon:
         icon.stop()
         if self.on_exit:
             self.on_exit()
+
+    def _handle_update(self, icon, item):
+        """Открывает страницу релизов в браузере."""
+        try:
+            from update_checker import RELEASES_PAGE
+            webbrowser.open(RELEASES_PAGE)
+        except Exception as e:
+            logger.error(f"Не удалось открыть страницу обновления: {e}")
+
+    def set_update_available(self, version: str):
+        """
+        Сообщает трею, что вышла новая версия: появляется пункт меню
+        «Скачать версию X», всплывашка и приписка в подсказке.
+        Вызывается фоновой проверкой обновлений.
+        """
+        # Проверка обновлений ходит на GitHub раз в сутки и зовёт этот метод
+        # каждый раз. Пункт меню обновляем всегда, а всплывашку показываем
+        # ТОЛЬКО когда версия действительно новая — иначе одно и то же
+        # окошко выскакивало бы каждые 24 часа и раздражало.
+        already_known = (version == self._update_version)
+        self._update_version = version
+        if already_known:
+            return
+        try:
+            from version import APP_NAME, APP_VERSION
+            if self._icon is not None:
+                self._icon.title = (f"{APP_NAME} v{APP_VERSION} — "
+                                    f"доступна версия {version}")
+        except Exception as e:
+            logger.debug(f"Подсказка трея не обновлена: {e}")
+        self.notify(
+            f"Доступна версия {version}. Нажми на иконку в трее правой "
+            f"кнопкой → Скачать.",
+            "Вышло обновление L2 Watcher",
+        )
 
     def notify(self, message: str, title: str = None):
         """

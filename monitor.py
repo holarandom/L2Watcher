@@ -59,6 +59,13 @@ class GameWindow:
         # "почему не ловится" (окно меньше шаблона).
         self.last_frame_size = None
 
+        # Какие шаблоны СЕЙЧАС не влезают в окно. Нужно, чтобы предупреждение
+        # писалось ОДИН раз при переходе в это состояние, а не каждый тик:
+        # свёрнутое на ночь окно давало 333 одинаковых строки на шаблон, и
+        # предупреждения занимали 97% лога — из-за них /log (последние 500
+        # строк) переставал показывать хоть что-то полезное.
+        self._size_warned = set()
+
         # Реальное состояние на последнем тике — для /status. В отличие от
         # *_notified флагов (которые завязаны на combined-логику "одно
         # уведомление на проблему" и молча сбрасываются), это поле всегда
@@ -98,12 +105,25 @@ class GameWindow:
             th, tw = template.shape[:2]
             fh, fw = frame.shape[:2]
             if th > fh or tw > fw:
-                logger.warning(
-                    f"[{self.label}] {name}: окно {fw}x{fh} МЕНЬШЕ шаблона "
-                    f"{tw}x{th} — тик пропущен (окно свёрнуто или шаблон "
-                    f"обучен на большем разрешении; переобучи через /retrain)"
-                )
+                if name not in self._size_warned:
+                    self._size_warned.add(name)
+                    logger.warning(
+                        f"[{self.label}] {name}: окно {fw}x{fh} МЕНЬШЕ шаблона "
+                        f"{tw}x{th} — детект приостановлен (окно свёрнуто или "
+                        f"шаблон обучен на большем разрешении). Повторы не "
+                        f"пишу, сообщу когда окно вернётся к рабочему размеру"
+                    )
+                else:
+                    logger.debug(f"[{self.label}] {name}: окно всё ещё {fw}x{fh}")
                 return 0.0
+
+            if name in self._size_warned:
+                # Окно вернулось к рабочему размеру — сообщаем один раз,
+                # чтобы по логу было видно, когда детект возобновился.
+                self._size_warned.discard(name)
+                logger.info(
+                    f"[{self.label}] {name}: окно снова {fw}x{fh} — детект возобновлён"
+                )
 
             result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
             _, max_val, _, _ = cv2.minMaxLoc(result)

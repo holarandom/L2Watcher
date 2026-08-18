@@ -73,6 +73,10 @@ if exist "app_icon.ico" (
     del /q "app_icon.ico"
     echo   removed app_icon.ico
 )
+if exist "file_version_info.txt" (
+    del /q "file_version_info.txt"
+    echo   removed file_version_info.txt
+)
 
 REM ---- Demo screenshots (exact prefixes only, never tray/template png) ----
 for %%F in ("6_*.png" "7_*.png" "8_*.png") do (

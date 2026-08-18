@@ -933,9 +933,17 @@ def main():
                        or shutil.which("py"))
             if _py:
                 global _feedback_proc
+                # cwd НАМЕРЕННО не в папке приложения. Рабочая папка процесса
+                # блокируется Windows: пока приёмник жив, папку dist\L2Watcher
+                # нельзя удалить, и сборка падала с "файл занят другим
+                # процессом" — причём приёмник переживал даже taskkill по
+                # L2Watcher.exe, потому что это отдельный процесс.
+                # Самому приёмнику cwd не нужен: путь к конфигу он берёт от
+                # своего __file__, а не от текущей папки.
+                from config_manager import get_config_dir
                 _feedback_proc = subprocess.Popen(
                     [_py, _fb_script],
-                    cwd=_base,
+                    cwd=get_config_dir(),
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 )
                 logging.getLogger(__name__).info(
@@ -987,6 +995,18 @@ def main():
     setup_logging(cfg)
     from version import APP_NAME, APP_VERSION
     logger.info(f"=== {APP_NAME} v{APP_VERSION} запускается ===")
+
+    # Разовый переезд автозагрузки: запись в реестре → ярлык в папке
+    # «Автозагрузка». Реестровый ключ Run — признак, по которому антивирусы
+    # ищут закрепление вредоносов, и Defender назвал наш runkey среди причин
+    # срабатывания. Без этого переезда у тех, у кого автозапуск был включён,
+    # он бы молча отвалился после обновления.
+    try:
+        import autostart
+        if autostart.migrate_from_registry():
+            logger.info("Автозагрузка переведена с реестра на ярлык")
+    except Exception as e:
+        logger.warning(f"Переезд автозагрузки не выполнен: {e}")
 
     app = L2MonitorApp(cfg)
 

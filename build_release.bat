@@ -49,9 +49,24 @@ if not "%SETVER_RC%"=="0" (
 echo.
 echo [release] Running normal build...
 call build.bat
+set BUILD_RC=%errorlevel%
 
-REM build.bat may end with pause/nonzero code even on success -
-REM so we check the actual result file instead of errorlevel.
+REM ВАЖНО: проверяем именно КОД ВОЗВРАТА build.bat, а не наличие exe.
+REM Раньше проверялось только "лежит ли L2Watcher.exe" — и когда сборка
+REM падала (например приложение было запущено и файлы оказались заняты),
+REM в dist оставался СТАРЫЙ exe, проверка его находила, и релиз спокойно
+REM паковал в архив предыдущую сборку. Именно так уехал битый zip.
+if not "%BUILD_RC%"=="0" (
+    echo.
+    echo ============================================================
+    echo   [ERROR] Build failed with code %BUILD_RC%. Release aborted.
+    echo   Scroll up for the reason, or open build_log.txt
+    echo ============================================================
+    echo.
+    pause
+    exit /b 1
+)
+
 if not exist "dist\L2Watcher\L2Watcher.exe" (
     echo Build failed - L2Watcher.exe not found. See build_log.txt
     pause
@@ -67,9 +82,36 @@ echo.
 echo [release] Packing zip...
 set ZIPNAME=L2Watcher_v%NEWVER%.zip
 if exist "%ZIPNAME%" del "%ZIPNAME%"
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\L2Watcher\*' -DestinationPath '%ZIPNAME%' -Force"
+REM -ErrorAction Stop + exit 1 обязательны: без них Compress-Archive пишет
+REM ошибку красным, но возвращает КОД 0, и errorlevel её не ловит. Именно
+REM так был собран неполный архив без base_library.zip — скрипт отрапортовал
+REM об успехе.
+powershell -NoProfile -Command "try { Compress-Archive -Path 'dist\L2Watcher\*' -DestinationPath '%ZIPNAME%' -Force -ErrorAction Stop } catch { Write-Output $_.Exception.Message; exit 1 }"
 if errorlevel 1 (
-    echo Zip packing failed
+    echo.
+    echo ============================================================
+    echo   [ERROR] Zip packing failed. Release aborted.
+    echo   Usually means a file in dist\ is locked - is the app running?
+    echo ============================================================
+    echo.
+    pause
+    exit /b 1
+)
+
+REM -- Сверяем: в архиве должно быть столько же файлов, сколько в dist. --
+REM -- Иначе архив неполный, а внешне выглядит нормальным.             --
+echo     Verifying archive contents...
+REM ВНИМАНИЕ: труба внутри кавычек пишется БЕЗ ^. Внутри "..." cmd её и так
+REM не трогает, а "^|" уезжает в PowerShell литералом и роняет разбор строки
+REM ("Unexpected token '^'") — из-за этого падала упаковка релиза.
+powershell -NoProfile -Command "$d=(Get-ChildItem 'dist\L2Watcher' -Recurse -File).Count; Add-Type -A System.IO.Compression.FileSystem; $z=[IO.Compression.ZipFile]::OpenRead((Resolve-Path '%ZIPNAME%')); $c=($z.Entries | Where-Object { $_.Name -ne '' }).Count; $z.Dispose(); Write-Output ('     dist: ' + $d + ' files, zip: ' + $c + ' files'); if ($c -lt $d) { Write-Output '     MISMATCH - archive is incomplete'; exit 1 }"
+if errorlevel 1 (
+    echo.
+    echo ============================================================
+    echo   [ERROR] Archive is INCOMPLETE - do not publish it.
+    echo   Close L2 Watcher completely and run the release again.
+    echo ============================================================
+    echo.
     pause
     exit /b 1
 )

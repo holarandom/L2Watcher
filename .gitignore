@@ -6,6 +6,7 @@ feedback_config.json
 templates/
 template_*.png
 app_icon.ico
+file_version_info.txt
 
 # ── Сборка ──────────────────────────────────────────────────
 build/
