@@ -33,7 +33,6 @@ echo   - any .py source files
 echo   - tray_icon.png, template_*.png, l2watcher_*_256.png
 echo   - config.json, feedback_config.json, *.log
 echo   - docs\, .git\
-echo   - exp\ and exp_module.zip   (PRIVATE MODULE - never touched)
 echo.
 echo After this it will ASK SEPARATELY about heavy leftovers
 echo (old release zips, unpacked builds, dist\, UI mockups).
@@ -117,7 +116,7 @@ echo   L2Watcher_v*\         unpacked old builds
 echo   dist\                 last build output (rebuild anytime)
 echo   L2Watcher UI mockups.zip   design mockups (already applied)
 echo.
-echo NOT touched here either: exp\, exp_module.zip, docs\, .git\
+echo NOT touched here either: docs, .git
 echo.
 set /p CONFIRM2="Type Y and press Enter to delete these too (anything else skips): "
 if /i not "%CONFIRM2%"=="Y" (
